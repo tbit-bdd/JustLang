@@ -12,6 +12,7 @@
 - **Cross-platform** — Windows and Linux from the same code
 - **Familiar syntax** — if you know JavaScript or Python, you'll feel at home
 - **Tracing GC** — mark-and-sweep garbage collector
+- **Modules** — split code across files with `import`
 - **C plugins** — extend the language with native code
 - **50+ builtins** — JSON, HTTP, files, strings, math, and more
 
@@ -80,6 +81,33 @@ for (let i = 0; i < 5; i = i + 1) {
 
 ---
 
+## Modules (import)
+
+Split your code across multiple files with `import`:
+
+**math.just:**
+```javascript
+func add(a, b) {
+    return a + b
+}
+
+func multiply(a, b) {
+    return a * b
+}
+```
+
+**main.just:**
+```javascript
+import "math.just"
+
+print(add(10, 20))       // 30
+print(multiply(5, 6))    // 30
+```
+
+Imports are loaded once and share the global scope. Good for organizing larger projects.
+
+---
+
 ## Built-in Functions
 
 | Category | Functions |
@@ -89,11 +117,12 @@ for (let i = 0; i < 5; i = i + 1) {
 | **Input** | `input` |
 | **Strings** | `upper`, `lower`, `trim`, `split`, `join`, `replace`, `contains`, `len` |
 | **Math** | `sqrt`, `pow`, `abs`, `min`, `max`, `floor`, `ceil`, `round`, `random` |
-| **JSON** | `json`, `json_parse`, `read_json`, `write_json` |
+| **JSON** | `json`, `json_parse`, `read_json`, `write_json`, `export` |
 | **HTTP** | `http_get`, `http_post` |
 | **Files** | `read`, `write`, `exists`, `import_json` |
 | **Time** | `now`, `sleep` |
 | **System** | `exec`, `env`, `load_plugin` |
+| **Modules** | `import` |
 | **Collections** | `len`, `range`, `filter`, `map`, `keys`, `values`, `has`, `array_push`, `array_pop` |
 | **Colors** | `red`, `green`, `blue`, `yellow`, `magenta`, `cyan`, `bold` |
 | **Debug** | `error`, `task`, `watch` |
