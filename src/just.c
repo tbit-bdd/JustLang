@@ -1,4 +1,5 @@
 #include "just.h"
+#include <stdatomic.h>
 
 #define SQLITE_OMIT_LOAD_EXTENSION  
 #define SQLITE_THREADSAFE 0        
@@ -14,6 +15,26 @@ static void add_native_func(JustState *j, const char *name, NativeFunc func);
 
 static JustState* plugin_state = NULL;
 
+/* FIX #7 (plugin_state not thread-safe): plugin_state is process-global,
+ * written by builtin_load_plugin() just long enough for the plugin's
+ * init_plugin() to call plugin_adapter() back into it. If two threads called
+ * load_plugin() concurrently, one thread's plugin functions could get
+ * registered onto the *other* thread's JustState, or plugin_state could be
+ * cleared out from under a still-running load. A lightweight spinlock
+ * around the whole "set plugin_state -> run init -> clear plugin_state"
+ * section serializes plugin loading process-wide, which is sufficient since
+ * plugin loading is rare and short-lived (no external dependency needed,
+ * unlike pthread_mutex_t). */
+static atomic_flag plugin_lock = ATOMIC_FLAG_INIT;
+static void plugin_lock_acquire(void) {
+    while (atomic_flag_test_and_set_explicit(&plugin_lock, memory_order_acquire)) {
+        /* busy-wait: plugin loading is rare/short, a spinlock is adequate */
+    }
+}
+static void plugin_lock_release(void) {
+    atomic_flag_clear_explicit(&plugin_lock, memory_order_release);
+}
+
 static void plugin_adapter(const char *name, NativeFunc func) {
     if (plugin_state) {
         add_native_func(plugin_state, name, func);
@@ -28,6 +49,15 @@ char* str_dup(const char *s) {
 }
 
 void just_error(JustState *j, const char *msg) { 
+    /* FIX #5: previously dereferenced j->current_line / j->scope_depth
+     * unconditionally, so calling just_error() with j == NULL (a plausible
+     * embedding-API misuse, e.g. before just_init() succeeded) segfaulted
+     * instead of reporting the error. Also guard against a NULL message. */
+    if (!msg) msg = "(no message)";
+    if (!j) {
+        fprintf(stderr, "\nERROR: %s\n", msg);
+        return;
+    }
     fprintf(stderr, "\nERROR (line %d): %s\n", j->current_line, msg); 
     fprintf(stderr, "  Stack trace:\n"); 
     for (int s = j->scope_depth - 1; s >= 0; s--) 
@@ -147,6 +177,9 @@ void gc_sweep(JustState *j) {
             Value *v = curr->value;
             switch (v->type) {
                 case TYPE_STRING: free(v->data.string); break;
+                case TYPE_FUNCTION:  // ← ДОБАВЬ ЭТОТ КЕЙС!
+                    free(v->data.string);
+                    break;
                 case TYPE_OBJECT:
                     for (int i = 0; i < v->data.object.count; i++) free(v->data.object.keys[i]);
                     free(v->data.object.keys); free(v->data.object.values); break;
@@ -289,8 +322,18 @@ Value* clone_value(JustState *j, Value *v) {
 }
 
 Value* array_get(Value *arr, int index) { 
-    if (!arr || arr->type != TYPE_ARRAY || index < 0 || index >= arr->data.array.count) 
-        return create_value(NULL, TYPE_NULL); 
+    if (!arr || arr->type != TYPE_ARRAY || index < 0 || index >= arr->data.array.count) {
+        /* FIX #4: array_get()/just_array_get() take no JustState*, so we
+         * cannot allocate a proper GC-tracked null Value here (the previous
+         * code passed NULL as the state to create_value(), which
+         * immediately dereferences it and crashes). Return a shared,
+         * statically-allocated, permanently-marked "null" sentinel instead
+         * -- it's read-only, never registered with any GC list, so it's
+         * always safe to hand back regardless of which interpreter is
+         * calling. */
+        static Value out_of_range_null = { .type = TYPE_NULL, .gc_node = NULL, .marked = true };
+        return &out_of_range_null;
+    }
     arr->data.array.items[index]->marked = true;
     return arr->data.array.items[index];
 }
@@ -650,6 +693,33 @@ Function* find_func(JustState *j, const char *name) {
     return NULL; 
 }
 
+Value* call_function_value(JustState *j, Value *fn, Value **args, int argc) {
+    if (!fn) return create_value(j, TYPE_NULL);
+    if (fn->type == TYPE_NATIVE_FUNC) {
+        return fn->data.native_func(j, args, argc);
+    }
+    if (fn->type == TYPE_FUNCTION) {
+        Function *f = find_func(j, fn->data.string);
+        if (!f) return create_value(j, TYPE_NULL);
+        if (f->is_native) return f->native_func(j, args, argc);
+        push_scope(j);
+        for (int i = 0; i < f->param_count && i < argc; i++)
+            set_var(j, f->params[i], args[i], false);
+        int od = j->scope_depth;
+        ControlFlow of = j->current_flow;
+        j->current_flow = FLOW_NORMAL;
+        j->return_value = NULL;
+        execute_block(j, f->body_start, f->body_end);
+        j->current_flow = of;
+        Value *saved_return = j->return_value;
+        while (j->scope_depth > od) pop_scope(j);
+        Value *r = saved_return ? saved_return : create_value(j, TYPE_NULL);
+        j->return_value = NULL;
+        return r;
+    }
+    return create_value(j, TYPE_NULL);
+}
+
 Value* builtin_print(JustState *j, Value **args, int count) { 
     for (int i = 0; i < count; i++) { 
         char *s = value_to_string_raw(args[i]); 
@@ -938,6 +1008,31 @@ Value* builtin_random(JustState *j, Value **args, int count) {
     return create_number(j, r * max); 
 }
 
+Value* builtin_substr(JustState *j, Value **args, int count) {
+    /* FIX #9: substr(str, start[, length]) was missing entirely. Supports
+     * negative `start` to index from the end, like many scripting
+     * languages, and clamps out-of-range bounds instead of overrunning. */
+    if (count < 2 || args[0]->type != TYPE_STRING) return create_string(j, "");
+    const char *s = args[0]->data.string;
+    int len = (int)strlen(s);
+    int start = (int)value_to_number(args[1]);
+    if (start < 0) start += len;
+    if (start < 0) start = 0;
+    if (start > len) start = len;
+    int take = len - start;
+    if (count >= 3) {
+        take = (int)value_to_number(args[2]);
+        if (take < 0) take = 0;
+    }
+    if (start + take > len) take = len - start;
+    char *out = malloc((size_t)take + 1);
+    memcpy(out, s + start, (size_t)take);
+    out[take] = '\0';
+    Value *v = create_string(j, out);
+    free(out);
+    return v;
+}
+
 Value* builtin_sin(JustState *j, Value **args, int count) {
     if (count < 1) return create_number(j, 0);
     return create_number(j, sin(value_to_number(args[0])));
@@ -964,23 +1059,33 @@ Value* builtin_exp(JustState *j, Value **args, int count) {
 }
 
 Value* builtin_filter(JustState *j, Value **args, int count) { 
-    if (count < 1 || args[0]->type != TYPE_ARRAY) return create_array(j); 
+    if (count < 2 || args[0]->type != TYPE_ARRAY ||
+        (args[1]->type != TYPE_NATIVE_FUNC && args[1]->type != TYPE_FUNCTION))
+        return create_array(j); 
+    
     Value *result = create_array(j); 
     for (int i = 0; i < args[0]->data.array.count; i++) { 
         Value *item = args[0]->data.array.items[i]; 
-        if (value_to_bool(item)) array_push(result, item); 
+        item->marked = true;
+        Value *cond = call_function_value(j, args[1], &item, 1);
+        if (value_to_bool(cond)) array_push(result, item); 
     } 
     return result; 
 }
 
 Value* builtin_map(JustState *j, Value **args, int count) { 
-    if (count < 2 || args[0]->type != TYPE_ARRAY || args[1]->type != TYPE_NATIVE_FUNC) 
+    /* FIX #2: previously required args[1]->type == TYPE_NATIVE_FUNC and
+     * called it directly, so a user-defined ("script") function could never
+     * be passed as the transform, and there was no way to even produce a
+     * function value from a bare function name in the first place. */
+    if (count < 2 || args[0]->type != TYPE_ARRAY ||
+        (args[1]->type != TYPE_NATIVE_FUNC && args[1]->type != TYPE_FUNCTION))
         return create_array(j); 
     Value *result = create_array(j); 
     for (int i = 0; i < args[0]->data.array.count; i++) { 
         Value *item = args[0]->data.array.items[i]; 
         item->marked = true; 
-        Value *mapped = args[1]->data.native_func(j, &item, 1); 
+        Value *mapped = call_function_value(j, args[1], &item, 1);
         array_push(result, mapped); 
     } 
     return result; 
@@ -1209,6 +1314,9 @@ Value* builtin_load_plugin(JustState *j, Value **args, int count) {
     char *name = args[0]->data.string;
     char fn[MAX_STRING];
     
+    // FIX #7: serialize the whole plugin_state critical section
+    plugin_lock_acquire();
+    // Сохраняем состояние для адаптера
     plugin_state = j;
     
 #ifdef _WIN32
@@ -1216,12 +1324,14 @@ Value* builtin_load_plugin(JustState *j, Value **args, int count) {
     HMODULE h = LoadLibraryA(fn);
     if (!h) {
         plugin_state = NULL;
+        plugin_lock_release();
         return create_bool(j, false);
     }
     void (*init)(RegisterFunc) = (void(*)(RegisterFunc))GetProcAddress(h, "init_plugin");
     if (!init) { 
         FreeLibrary(h); 
         plugin_state = NULL;
+        plugin_lock_release();
         return create_bool(j, false); 
     }
     init(plugin_adapter);
@@ -1230,12 +1340,14 @@ Value* builtin_load_plugin(JustState *j, Value **args, int count) {
     void *h = dlopen(fn, RTLD_NOW);
     if (!h) {
         plugin_state = NULL;
+        plugin_lock_release();
         return create_bool(j, false);
     }
     void (*init)(RegisterFunc) = (void(*)(RegisterFunc))dlsym(h, "init_plugin");
     if (!init) { 
         dlclose(h); 
         plugin_state = NULL;
+        plugin_lock_release();
         return create_bool(j, false); 
     }
     init(plugin_adapter);
@@ -1245,6 +1357,7 @@ Value* builtin_load_plugin(JustState *j, Value **args, int count) {
     j->loaded_plugins[j->loaded_plugin_count++] = h;
     
     plugin_state = NULL;
+    plugin_lock_release();
     return create_bool(j, true);
 }
 
@@ -1900,6 +2013,16 @@ Value* builtin_db_error(JustState *j, Value **args, int count) {
     return create_string(j, err ? err : "");
 }
 
+Value* builtin_gc_get_count(JustState *j, Value **args, int count) {
+    (void)args; (void)count;
+    return create_number(j, j->gc_count);
+}
+
+Value* builtin_gc_get_allocations(JustState *j, Value **args, int count) {
+    (void)args; (void)count;
+    return create_number(j, j->total_allocations);
+}
+
 void add_native_func(JustState *j, const char *name, NativeFunc func) { 
     if (!j) return;
     for (int i = 0; i < j->func_count; i++) 
@@ -1919,9 +2042,8 @@ void add_native_func(JustState *j, const char *name, NativeFunc func) {
 }
 
 void register_builtins(JustState *j) {
-    static bool registered = false;
-    if (registered) return;
-    registered = true;
+	if (j->builtins_registered) return;
+	j->builtins_registered = true;
     
     add_native_func(j, "print", builtin_print); 
     add_native_func(j, "type", builtin_type); 
@@ -2022,6 +2144,9 @@ void register_builtins(JustState *j) {
 	add_native_func(j, "db_commit", builtin_db_commit);
 	add_native_func(j, "db_rollback", builtin_db_rollback);
 	add_native_func(j, "db_error", builtin_db_error);
+	add_native_func(j, "substr", builtin_substr);
+	add_native_func(j, "gc_get_count", builtin_gc_get_count);
+	add_native_func(j, "gc_get_allocations", builtin_gc_get_allocations);
 }
 
 // Tokenizer
@@ -2341,9 +2466,26 @@ Value* eval_primary(JustState *j, int *pos) {
             return create_value(j, TYPE_NULL); 
         } 
         (*pos)++; 
-        Variable *v = find_var(j, t); 
-        if (v) return v->value; 
-        return create_value(j, TYPE_NULL); 
+		Variable *v = find_var(j, t); 
+		if (v) return v->value; 
+
+		/* FIX #1/#2 (first-class functions): a bare function name used to
+		 * always fall through to null here, which is exactly why
+		 * filter()/map() had no way to receive a predicate/transform
+		 * function -- there was no way to produce a function *value* from
+		 * an identifier at all. Now it resolves to a callable value. */
+		Function *fref = find_func(j, t);
+		if (fref) {
+			if (fref->is_native) {
+				Value *fv = create_value(j, TYPE_NATIVE_FUNC);
+				fv->data.native_func = fref->native_func;
+				return fv;
+			}
+			Value *fv = create_value(j, TYPE_FUNCTION);
+			fv->data.string = str_dup(t);
+			return fv;
+		}
+		return create_value(j, TYPE_NULL);
     } 
     (*pos)++; 
     return create_value(j, TYPE_NULL); 
@@ -3014,6 +3156,9 @@ void run_code(JustState *j, const char *src) {
 JustState* just_init(void) {
     srand((unsigned)time(NULL));
     JustState *j = calloc(1, sizeof(JustState));
+    if (!j) return NULL;
+    j->gc_threshold = GC_THRESHOLD;
+    j->imported_file_count = 0;
 #ifdef _WIN32
     j->win10_ansi_supported = false;
 #endif
@@ -3063,8 +3208,11 @@ void just_gc_collect(JustState *j) {
 }
 
 void just_gc_set_threshold(JustState *j, int threshold) {
-    (void)j;
-    (void)threshold;
+    /* FIX: this used to be a complete no-op despite being public API that
+     * promises to configure the GC. Now it actually adjusts the per-instance
+     * threshold used by create_value() to decide when to collect. */
+    if (!j || threshold <= 0) return;
+    j->gc_threshold = threshold;
 }
 
 int just_gc_get_count(JustState *j) {
@@ -3214,9 +3362,34 @@ void shutdown_cleanup(JustState *j) {
         }
     }
     
+    /* FIX (small leak): free the per-instance import cache (fix #3) too. */
+    for (int i = 0; i < j->imported_file_count; i++) free(j->imported_files[i]);  // ← ДОБАВЬ ЭТО
+
     GCNode *node = j->gc_head;
     while (node) { 
         GCNode *next = node->next; 
+        /* FIX #10 (major GC leak): this loop used to free only the GCNode
+         * wrapper and never the Value it pointed to -- nor that Value's own
+         * owned memory (strings, object key/value arrays, array item
+         * buffers). Every value still alive at program exit leaked in
+         * full. Free each value's internal memory the same way
+         * gc_sweep() does, then the Value struct itself, before freeing
+         * the node. */
+        if (node->value) {
+            Value *v = node->value;
+            switch (v->type) {
+                case TYPE_STRING: free(v->data.string); break;
+                case TYPE_FUNCTION: free(v->data.string); break;  // ← ДОБАВЬ ЭТО
+                case TYPE_OBJECT:
+                    for (int i = 0; i < v->data.object.count; i++) free(v->data.object.keys[i]);
+                    free(v->data.object.keys);
+                    free(v->data.object.values);
+                    break;
+                case TYPE_ARRAY: free(v->data.array.items); break;
+                default: break;
+            }
+            free(v);
+        }
         free(node); 
         node = next; 
     }
