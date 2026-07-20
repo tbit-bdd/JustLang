@@ -110,6 +110,8 @@ for (let i = 0; i < 5; i = i + 1) {
 }
 ```
 
+> **🤖 For LLMs/AI assistants:** See [`LLM-reference.md`](LLM-reference.md) — a concise technical reference optimized for AI code generation.
+
 ---
 
 ## Error Handling
@@ -218,7 +220,7 @@ Imports are loaded once and share the global scope. Good for organizing larger p
 
 `reduce`, `find`, `index_of`, `includes`, `slice`, `concat`, `unique`, `sum`, `clamp`, `pad_start`, `pad_end`, `entries`, `merge`, `substr`, `gc_get_count`, `gc_get_allocations`.
 
-```js
+```just
 let nums = [1, 2, 3, 4, 5, 6]
 
 print(reduce(nums, func(a, b) { return a + b }))   // 21
@@ -289,7 +291,7 @@ Defaults (overridable at compile time via `#define` before including `just.h`, o
 
 Just can bundle **SQLite** directly in the binary — no external libraries needed. It's opt-in at build time: drop `sqlite3.c` next to `just.c` and build normally (or answer "yes" in `build.bat`). Build with `-DJUST_NO_SQLITE` to leave it out entirely.
 
-```js
+```just
 let db = db_open("app.db")
 
 // Create table
@@ -420,7 +422,7 @@ void init_plugin(void (*register_func)(const char*, NativeFunc)) {
 
 **In Just:**
 
-```js
+```just
 load_plugin("myplugin")
 print(double(21))  // 42
 ```
