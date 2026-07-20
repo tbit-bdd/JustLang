@@ -67,7 +67,7 @@ just
 
 **hello.just:**
 
-```js
+```just
 print("Hello from Just!")
 ```
 
@@ -75,7 +75,7 @@ print("Hello from Just!")
 
 ## Syntax at a Glance
 
-```js
+```just
 // Variables
 let name = "Just"
 const version = 3
@@ -116,7 +116,7 @@ for (let i = 0; i < 5; i = i + 1) {
 
 Runtime failures that used to crash the interpreter now raise **catchable** errors: division/modulo by zero, exceeding the call-depth limit, and explicit `error()`/`throw` calls.
 
-```js
+```just
 try {
     let x = 5 / 0
 } catch (e) {
@@ -147,7 +147,7 @@ withCleanup()
 
 Anonymous functions capture the enclosing scope **by value** at the moment they're created:
 
-```js
+```just
 func make_adder(n) {
     return func(x) { return x + n }
 }
@@ -169,7 +169,7 @@ Split your code across multiple files with `import`:
 
 **math.just:**
 
-```js
+```just
 func add(a, b) {
     return a + b
 }
@@ -181,7 +181,7 @@ func multiply(a, b) {
 
 **main.just:**
 
-```js
+```just
 import "math.just"
 
 print(add(10, 20))       // 30
