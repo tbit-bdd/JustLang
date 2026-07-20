@@ -1,6 +1,12 @@
 #ifndef JUST_H
 #define JUST_H
 
+#ifndef _WIN32
+    #define _POSIX_C_SOURCE 200809L
+    #define _DEFAULT_SOURCE
+#endif
+
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,13 +52,25 @@
     #define MAX_STRING 65536
 #endif
 #ifndef MAX_SCOPE_DEPTH
-    #define MAX_SCOPE_DEPTH 10000
+    #define MAX_SCOPE_DEPTH 100000
 #endif
 #ifndef MAX_ITERATIONS
     #define MAX_ITERATIONS 100000000
 #endif
 #ifndef GC_THRESHOLD
     #define GC_THRESHOLD 50000
+#endif
+
+
+#define JUST_CAP_EXEC    (1 << 0)  
+#define JUST_CAP_FILES   (1 << 1)  
+#define JUST_CAP_NET     (1 << 2)  
+#define JUST_CAP_PLUGIN  (1 << 3)  
+#define JUST_CAP_DB      (1 << 4)  
+#define JUST_CAP_ALL     (~0)
+#ifndef MAX_CALL_DEPTH
+
+    #define MAX_CALL_DEPTH 150
 #endif
 
 typedef struct Value Value;
@@ -65,7 +83,6 @@ typedef void (*RegisterFunc)(const char*, NativeFunc);
 struct GCNode {
     Value *value;
     GCNode *next;
-    bool marked;
 };
 
 typedef enum { 
@@ -96,15 +113,24 @@ struct Value {
             int count, capacity; 
         } array; 
         NativeFunc native_func; 
+        struct {
+            int body_start, body_end;
+            char **params;
+            int param_count;
+            Value *captured; 
+        } lambda;
     } data; 
     bool marked;
+    bool is_lambda; 
 };
 
 typedef enum { 
     FLOW_NORMAL, 
     FLOW_BREAK, 
     FLOW_CONTINUE, 
-    FLOW_RETURN 
+    FLOW_RETURN,
+    FLOW_ERROR   
+                  
 } ControlFlow;
 
 typedef struct { 
@@ -130,32 +156,43 @@ typedef struct {
 } Scope;
 
 struct JustState {
-    // GC
+    
+
     GCNode *gc_head;
     GCNode *gc_tail;
     int gc_count;
     int total_allocations;
     int gc_threshold;
     
-    // Scopes
-    Scope *scopes[MAX_SCOPE_DEPTH];
+    Scope **scopes;
     int scope_depth;
+    int scope_capacity;
     
-    // Functions
+    
+
     Function *funcs;
     int func_count;
     int func_capacity;
     
-    // Tokens
+    
+
     char **tokens;
     int token_count;
     int token_capacity;
+    int *token_lines; 
+    bool token_limit_hit; 
     
-    // Control flow
+    
+
     ControlFlow current_flow;
     Value *return_value;
+    char *error_message;
+    Value *error_value;    
+    int call_depth;        
+    const char *call_stack[MAX_CALL_DEPTH]; 
     
-    // State
+    
+
     int current_line;
     bool winsock_initialized;
     void **loaded_plugins;
@@ -164,6 +201,17 @@ struct JustState {
     bool builtins_registered;
     char *imported_files[100];
     int imported_file_count;
+
+    void **handles;
+    int handle_count;
+    int handle_capacity;
+
+    uint32_t rand_seed;
+    int capabilities; 
+
+    int max_iterations;
+    int max_call_depth;
+    long max_tokens;
     
 #ifdef _WIN32
     bool win10_ansi_supported;
@@ -171,6 +219,7 @@ struct JustState {
 };
 
 JustState* just_init(void);
+JustState* just_init_ex(int capabilities); 
 void just_destroy(JustState *j);
 
 Value* just_eval(JustState *j, const char *code);
@@ -197,6 +246,10 @@ void just_gc_collect(JustState *j);
 void just_gc_set_threshold(JustState *j, int threshold);
 int just_gc_get_count(JustState *j);
 int just_gc_get_allocations(JustState *j);
+
+void just_set_max_iterations(JustState *j, int n);  
+void just_set_max_call_depth(JustState *j, int n);  
+void just_set_max_tokens(JustState *j, long n);      
 
 Value* just_object_new(JustState *j);
 void just_object_set(Value *obj, const char *key, Value *val);

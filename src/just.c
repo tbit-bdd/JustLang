@@ -3,8 +3,10 @@
 
 #define SQLITE_OMIT_LOAD_EXTENSION  
 #define SQLITE_THREADSAFE 0        
-#define SQLITE_OMIT_DEPRECATED      
-#include "sqlite3.c"                 
+#define SQLITE_OMIT_DEPRECATED
+#ifndef JUST_NO_SQLITE
+#include "sqlite3.c"
+#endif                 
 
 typedef struct {
     JustState *j;
@@ -15,20 +17,11 @@ static void add_native_func(JustState *j, const char *name, NativeFunc func);
 
 static JustState* plugin_state = NULL;
 
-/* FIX #7 (plugin_state not thread-safe): plugin_state is process-global,
- * written by builtin_load_plugin() just long enough for the plugin's
- * init_plugin() to call plugin_adapter() back into it. If two threads called
- * load_plugin() concurrently, one thread's plugin functions could get
- * registered onto the *other* thread's JustState, or plugin_state could be
- * cleared out from under a still-running load. A lightweight spinlock
- * around the whole "set plugin_state -> run init -> clear plugin_state"
- * section serializes plugin loading process-wide, which is sufficient since
- * plugin loading is rare and short-lived (no external dependency needed,
- * unlike pthread_mutex_t). */
+
 static atomic_flag plugin_lock = ATOMIC_FLAG_INIT;
 static void plugin_lock_acquire(void) {
     while (atomic_flag_test_and_set_explicit(&plugin_lock, memory_order_acquire)) {
-        /* busy-wait: plugin loading is rare/short, a spinlock is adequate */
+        
     }
 }
 static void plugin_lock_release(void) {
@@ -49,19 +42,22 @@ char* str_dup(const char *s) {
 }
 
 void just_error(JustState *j, const char *msg) { 
-    /* FIX #5: previously dereferenced j->current_line / j->scope_depth
-     * unconditionally, so calling just_error() with j == NULL (a plausible
-     * embedding-API misuse, e.g. before just_init() succeeded) segfaulted
-     * instead of reporting the error. Also guard against a NULL message. */
+    
     if (!msg) msg = "(no message)";
     if (!j) {
         fprintf(stderr, "\nERROR: %s\n", msg);
         return;
     }
     fprintf(stderr, "\nERROR (line %d): %s\n", j->current_line, msg); 
-    fprintf(stderr, "  Stack trace:\n"); 
-    for (int s = j->scope_depth - 1; s >= 0; s--) 
-        fprintf(stderr, "  [%d] scope\n", s); 
+    
+    if (j->call_depth > 0) {
+        fprintf(stderr, "  Call stack (innermost first):\n"); 
+        int shown = 0;
+        for (int s = j->call_depth - 1; s >= 0 && shown < 15; s--, shown++) 
+            fprintf(stderr, "    at %s()\n", j->call_stack[s] ? j->call_stack[s] : "?"); 
+        if (j->call_depth - shown > 0) 
+            fprintf(stderr, "    ... (%d more frame%s omitted)\n", j->call_depth - shown, (j->call_depth - shown) == 1 ? "" : "s");
+    }
 }
 
 #ifdef _WIN32
@@ -71,6 +67,7 @@ void just_sleep_ms(int ms) { usleep(ms * 1000); }
 #endif
 
 static void gc_add_node(JustState *j, Value *v);
+static void adopt_into_gc(JustState *j, Value *v);
 static void gc_mark_value(JustState *j, Value *v);
 static void gc_mark_roots(JustState *j);
 static void gc_sweep(JustState *j);
@@ -80,6 +77,7 @@ static Value* create_number(JustState *j, double n);
 static Value* create_string(JustState *j, const char *s);
 static Value* create_bool(JustState *j, bool b);
 static Value* create_object(JustState *j);
+static Value* capture_scope(JustState *j);
 static Value* create_array(JustState *j);
 static Value* clone_value_internal(JustState *j, Value *v, int depth);
 static Value* clone_value(JustState *j, Value *v);
@@ -88,8 +86,16 @@ static Value* object_get(Value *obj, const char *key);
 static bool object_has(Value *obj, const char *key);
 static void array_push(Value *arr, Value *val);
 static Value* array_get(Value *arr, int index);
+static int normalize_index(int index, int len);
+#ifndef JUST_NO_SQLITE
+static int handle_alloc(JustState *j, void *ptr);
+static void* handle_get(JustState *j, int id);
+static void handle_free(JustState *j, int id);
+#endif
+static uint32_t xorshift32(uint32_t *state);
 static void array_set(Value *arr, int index, Value *val);
 static double value_to_number(Value *v);
+static bool values_equal(Value *l, Value *r);
 static bool value_to_bool(Value *v);
 static char* value_to_string_raw(Value *v);
 static Value* value_to_string(JustState *j, Value *v);
@@ -99,6 +105,7 @@ static void push_scope(JustState *j);
 static void pop_scope(JustState *j);
 static Variable* find_var(JustState *j, const char *name);
 static void set_var(JustState *j, const char *name, Value *value, bool constant);
+static void declare_var(JustState *j, const char *name, Value *value, bool constant);
 static void add_func(JustState *j, const char *name, char **params, int param_count, int start, int end);
 static Function* find_func(JustState *j, const char *name);
 static void register_builtins(JustState *j);
@@ -115,7 +122,6 @@ void gc_add_node(JustState *j, Value *v) {
     GCNode *node = malloc(sizeof(GCNode));
     if (!node) { just_error(j, "GC: Out of memory"); exit(1); }
     node->value = v;
-    node->marked = false;
     node->next = NULL;
     if (j->gc_tail) { 
         j->gc_tail->next = node; 
@@ -128,7 +134,25 @@ void gc_add_node(JustState *j, Value *v) {
     j->total_allocations++;
 }
 
+void adopt_into_gc(JustState *j, Value *v) {
+    
+    if (!v || v->gc_node) return;
+    gc_add_node(j, v);
+    switch (v->type) {
+        case TYPE_OBJECT:
+            for (int i = 0; i < v->data.object.count; i++)
+                adopt_into_gc(j, v->data.object.values[i]);
+            break;
+        case TYPE_ARRAY:
+            for (int i = 0; i < v->data.array.count; i++)
+                adopt_into_gc(j, v->data.array.items[i]);
+            break;
+        default: break;
+    }
+}
+
 void gc_mark_value(JustState *j, Value *v) {
+    (void)j; 
     if (!v || v->marked) return;
     
     Value *stack[10000];
@@ -158,6 +182,15 @@ void gc_mark_value(JustState *j, Value *v) {
                     }
                 }
                 break;
+            case TYPE_FUNCTION:
+                if (cur->is_lambda && cur->data.lambda.captured) {
+                    Value *child = cur->data.lambda.captured;
+                    if (!child->marked) {
+                        child->marked = true;
+                        if (sp < 10000) stack[sp++] = child;
+                    }
+                }
+                break;
             default: break;
         }
     }
@@ -168,17 +201,26 @@ void gc_mark_roots(JustState *j) {
         for (int i = 0; i < j->scopes[s]->var_count; i++)
             gc_mark_value(j, j->scopes[s]->vars[i].value);
     if (j->return_value) gc_mark_value(j, j->return_value);
+    
+    if (j->error_value) gc_mark_value(j, j->error_value);
 }
 
 void gc_sweep(JustState *j) {
     GCNode *prev = NULL, *curr = j->gc_head;
     while (curr) {
-        if (!curr->marked && curr->value) {
+        
+        if (curr->value && !curr->value->marked) {
             Value *v = curr->value;
             switch (v->type) {
                 case TYPE_STRING: free(v->data.string); break;
-                case TYPE_FUNCTION:  // ← ДОБАВЬ ЭТОТ КЕЙС!
-                    free(v->data.string);
+                case TYPE_FUNCTION:
+                    if (v->is_lambda) {
+                        for (int i = 0; i < v->data.lambda.param_count; i++) free(v->data.lambda.params[i]);
+                        free(v->data.lambda.params);
+                        
+                    } else {
+                        free(v->data.string);
+                    }
                     break;
                 case TYPE_OBJECT:
                     for (int i = 0; i < v->data.object.count; i++) free(v->data.object.keys[i]);
@@ -205,7 +247,6 @@ void gc_sweep(JustState *j) {
 void gc_collect(JustState *j) {
     GCNode *node = j->gc_head;
     while (node) { 
-        node->marked = false; 
         if (node->value) node->value->marked = false; 
         node = node->next; 
     }
@@ -220,7 +261,6 @@ Value* create_value(JustState *j, ValueType type) {
     v->type = type; 
     v->marked = false;
     gc_add_node(j, v);
-    if (j->total_allocations >= GC_THRESHOLD) gc_collect(j);
     return v;
 }
 
@@ -321,17 +361,57 @@ Value* clone_value(JustState *j, Value *v) {
     return clone_value_internal(j, v, 0); 
 }
 
+
+
+
+uint32_t xorshift32(uint32_t *state) {
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+#ifndef JUST_NO_SQLITE
+
+int handle_alloc(JustState *j, void *ptr) {
+    for (int i = 0; i < j->handle_count; i++) {
+        if (j->handles[i] == NULL) { j->handles[i] = ptr; return i; }
+    }
+    if (j->handle_count >= j->handle_capacity) {
+        j->handle_capacity = j->handle_capacity ? j->handle_capacity * 2 : 16;
+        j->handles = realloc(j->handles, sizeof(void*) * j->handle_capacity);
+    }
+    j->handles[j->handle_count] = ptr;
+    return j->handle_count++;
+}
+void* handle_get(JustState *j, int id) {
+    if (id < 0 || id >= j->handle_count) return NULL;
+    return j->handles[id];
+}
+void handle_free(JustState *j, int id) {
+    if (id >= 0 && id < j->handle_count) j->handles[id] = NULL;
+}
+#endif 
+
+int normalize_index(int index, int len) {
+    if (index < 0) index += len;
+    return index;
+}
+
+
+static GCNode out_of_range_gc_sentinel;
+
 Value* array_get(Value *arr, int index) { 
-    if (!arr || arr->type != TYPE_ARRAY || index < 0 || index >= arr->data.array.count) {
-        /* FIX #4: array_get()/just_array_get() take no JustState*, so we
-         * cannot allocate a proper GC-tracked null Value here (the previous
-         * code passed NULL as the state to create_value(), which
-         * immediately dereferences it and crashes). Return a shared,
-         * statically-allocated, permanently-marked "null" sentinel instead
-         * -- it's read-only, never registered with any GC list, so it's
-         * always safe to hand back regardless of which interpreter is
-         * calling. */
-        static Value out_of_range_null = { .type = TYPE_NULL, .gc_node = NULL, .marked = true };
+    if (!arr || arr->type != TYPE_ARRAY) {
+        static Value out_of_range_null = { .type = TYPE_NULL, .gc_node = &out_of_range_gc_sentinel, .marked = true };
+        return &out_of_range_null;
+    }
+    index = normalize_index(index, arr->data.array.count);
+    if (index < 0 || index >= arr->data.array.count) {
+        
+        static Value out_of_range_null = { .type = TYPE_NULL, .gc_node = &out_of_range_gc_sentinel, .marked = true };
         return &out_of_range_null;
     }
     arr->data.array.items[index]->marked = true;
@@ -362,6 +442,20 @@ double value_to_number(Value *v) {
     } 
 }
 
+
+bool values_equal(Value *l, Value *r) {
+    if (!l || !r) return l == r;
+    if (l->type == TYPE_STRING && r->type == TYPE_STRING)
+        return strcmp(l->data.string, r->data.string) == 0;
+    if (l->type == TYPE_NULL || r->type == TYPE_NULL)
+        return l->type == r->type;
+    if (l->type == TYPE_BOOL && r->type == TYPE_BOOL)
+        return l->data.boolean == r->data.boolean;
+    if (l->type == TYPE_ARRAY || l->type == TYPE_OBJECT || r->type == TYPE_ARRAY || r->type == TYPE_OBJECT)
+        return l == r; 
+    return value_to_number(l) == value_to_number(r);
+}
+
 bool value_to_bool(Value *v) {
     if (!v) return false;
     switch (v->type) {
@@ -375,16 +469,27 @@ bool value_to_bool(Value *v) {
     }
 }
 
+
+static void format_double(double d, char *buf, size_t bufsize) {
+    if (isnan(d)) { snprintf(buf, bufsize, "nan"); return; }
+    if (isinf(d)) { snprintf(buf, bufsize, d > 0 ? "inf" : "-inf"); return; }
+    if (d == trunc(d) && fabs(d) <= 9007199254740992.0 ) {
+        snprintf(buf, bufsize, "%lld", (long long)d);
+        return;
+    }
+    for (int prec = 15; prec <= 17; prec++) {
+        snprintf(buf, bufsize, "%.*g", prec, d);
+        if (strtod(buf, NULL) == d) return;
+    }
+}
+
 char* value_to_string_raw(Value *v) { 
     if (!v) return str_dup("null"); 
     switch (v->type) { 
         case TYPE_NULL: return str_dup("null"); 
         case TYPE_NUMBER: { 
             char b[64]; 
-            if (v->data.number == (int)v->data.number) 
-                snprintf(b, 64, "%d", (int)v->data.number); 
-            else 
-                snprintf(b, 64, "%g", v->data.number); 
+            format_double(v->data.number, b, sizeof(b)); 
             return str_dup(b); 
         } 
         case TYPE_STRING: return str_dup(v->data.string); 
@@ -453,7 +558,9 @@ Value* value_to_json(JustState *j, Value *v) {
         case TYPE_NULL: return create_string(j, "null"); 
         case TYPE_NUMBER: { 
             char b[64]; 
-            snprintf(b, 64, "%g", v->data.number); 
+            
+            if (isnan(v->data.number) || isinf(v->data.number)) return create_string(j, "null"); 
+            format_double(v->data.number, b, sizeof(b)); 
             return create_string(j, b); 
         } 
         case TYPE_BOOL: return create_string(j, v->data.boolean ? "true" : "false"); 
@@ -620,6 +727,12 @@ void push_scope(JustState *j) {
         just_error(j, "Maximum scope depth exceeded"); 
         exit(1); 
     } 
+    if (j->scope_depth >= j->scope_capacity) { 
+        int new_cap = j->scope_capacity ? j->scope_capacity * 2 : 32; 
+        if (new_cap > MAX_SCOPE_DEPTH) new_cap = MAX_SCOPE_DEPTH; 
+        j->scopes = realloc(j->scopes, sizeof(Scope*) * new_cap); 
+        j->scope_capacity = new_cap; 
+    } 
     Scope *s = calloc(1, sizeof(Scope)); 
     s->var_capacity = 16; 
     s->vars = malloc(sizeof(Variable) * 16); 
@@ -645,7 +758,30 @@ Variable* find_var(JustState *j, const char *name) {
     return NULL; 
 }
 
+void declare_var(JustState *j, const char *name, Value *value, bool constant) {
+    
+    
+    adopt_into_gc(j, value);
+    Scope *cur = j->scopes[j->scope_depth - 1];
+    for (int i = 0; i < cur->var_count; i++) {
+        if (strcmp(cur->vars[i].name, name) == 0) {
+            cur->vars[i].value = value;
+            cur->vars[i].constant = constant;
+            return;
+        }
+    }
+    if (cur->var_count >= cur->var_capacity) { 
+        cur->var_capacity *= 2; 
+        cur->vars = realloc(cur->vars, sizeof(Variable) * cur->var_capacity); 
+    } 
+    cur->vars[cur->var_count].name = str_dup(name); 
+    cur->vars[cur->var_count].value = value; 
+    cur->vars[cur->var_count].constant = constant; 
+    cur->var_count++; 
+}
+
 void set_var(JustState *j, const char *name, Value *value, bool constant) { 
+    adopt_into_gc(j, value);
     for (int s = j->scope_depth - 1; s >= 0; s--) {
         for (int i = 0; i < j->scopes[s]->var_count; i++) {
             if (strcmp(j->scopes[s]->vars[i].name, name) == 0) {
@@ -693,26 +829,84 @@ Function* find_func(JustState *j, const char *name) {
     return NULL; 
 }
 
+Value* capture_scope(JustState *j) {
+    
+    Value *env = create_object(j);
+    for (int s = 0; s < j->scope_depth; s++) {
+        Scope *sc = j->scopes[s];
+        for (int i = 0; i < sc->var_count; i++)
+            object_set(env, sc->vars[i].name, sc->vars[i].value);
+    }
+    return env;
+}
+
 Value* call_function_value(JustState *j, Value *fn, Value **args, int argc) {
     if (!fn) return create_value(j, TYPE_NULL);
     if (fn->type == TYPE_NATIVE_FUNC) {
         return fn->data.native_func(j, args, argc);
     }
     if (fn->type == TYPE_FUNCTION) {
+        if (fn->is_lambda) {
+            
+            if (j->call_depth >= j->max_call_depth) {
+                just_error(j, "Maximum call stack size exceeded");
+                free(j->error_message);
+                j->error_message = str_dup("Maximum call stack size exceeded");
+                j->error_value = create_string(j, "Maximum call stack size exceeded");
+                j->current_flow = FLOW_ERROR;
+                return create_value(j, TYPE_NULL);
+            }
+            j->call_stack[j->call_depth] = "<lambda>";
+            j->call_depth++;
+            int od = j->scope_depth;
+            push_scope(j);
+            if (fn->data.lambda.captured) {
+                Value *cap = fn->data.lambda.captured;
+                for (int i = 0; i < cap->data.object.count; i++)
+                    declare_var(j, cap->data.object.keys[i], cap->data.object.values[i], false);
+            }
+            for (int i = 0; i < fn->data.lambda.param_count && i < argc; i++)
+                declare_var(j, fn->data.lambda.params[i], args[i], false);
+            ControlFlow of = j->current_flow;
+            j->current_flow = FLOW_NORMAL;
+            j->return_value = NULL;
+            execute_block(j, fn->data.lambda.body_start, fn->data.lambda.body_end);
+            if (j->current_flow != FLOW_ERROR) j->current_flow = of;
+            Value *saved_return = j->return_value;
+            while (j->scope_depth > od) pop_scope(j);
+            j->call_depth--;
+            Value *r = saved_return ? saved_return : create_value(j, TYPE_NULL);
+            j->return_value = NULL;
+            return r;
+        }
         Function *f = find_func(j, fn->data.string);
         if (!f) return create_value(j, TYPE_NULL);
         if (f->is_native) return f->native_func(j, args, argc);
+        
+        if (j->call_depth >= j->max_call_depth) {
+            just_error(j, "Maximum call stack size exceeded");
+            free(j->error_message);
+            j->error_message = str_dup("Maximum call stack size exceeded");
+            j->error_value = create_string(j, "Maximum call stack size exceeded");
+            j->current_flow = FLOW_ERROR;
+            return create_value(j, TYPE_NULL);
+        }
+        j->call_stack[j->call_depth] = f->name;
+        j->call_depth++;
+        
+        int od = j->scope_depth;
         push_scope(j);
         for (int i = 0; i < f->param_count && i < argc; i++)
-            set_var(j, f->params[i], args[i], false);
-        int od = j->scope_depth;
+            declare_var(j, f->params[i], args[i], false);
         ControlFlow of = j->current_flow;
         j->current_flow = FLOW_NORMAL;
         j->return_value = NULL;
         execute_block(j, f->body_start, f->body_end);
-        j->current_flow = of;
+        
+        if (j->current_flow != FLOW_ERROR) j->current_flow = of;
         Value *saved_return = j->return_value;
         while (j->scope_depth > od) pop_scope(j);
+        j->call_depth--;
         Value *r = saved_return ? saved_return : create_value(j, TYPE_NULL);
         j->return_value = NULL;
         return r;
@@ -747,6 +941,7 @@ Value* builtin_len(JustState *j, Value **args, int count) {
 }
 
 Value* builtin_input(JustState *j, Value **args, int count) { 
+    (void)args; (void)count; 
     char b[MAX_STRING]; 
     if (fgets(b, MAX_STRING, stdin)) { 
         b[strcspn(b, "\n")] = 0; 
@@ -809,7 +1004,8 @@ Value* builtin_has(JustState *j, Value **args, int count) {
     return create_bool(j, object_has(args[0], args[1]->data.string)); 
 }
 
-Value* builtin_read_file(JustState *j, Value **args, int count) { 
+Value* builtin_read_file(JustState *j, Value **args, int count) {
+    if (!(j->capabilities & JUST_CAP_FILES)) { just_error(j, "File access disabled for this interpreter"); return create_value(j, TYPE_NULL); } 
     if (count < 1 || args[0]->type != TYPE_STRING) return create_string(j, ""); 
     FILE *f = fopen(args[0]->data.string, "r"); 
     if (!f) return create_string(j, ""); 
@@ -817,7 +1013,7 @@ Value* builtin_read_file(JustState *j, Value **args, int count) {
     long sz = ftell(f); 
     fseek(f, 0, SEEK_SET); 
     char *b = malloc(sz + 1); 
-    fread(b, 1, sz, f); 
+    size_t _rd = fread(b, 1, sz, f); (void)_rd;
     b[sz] = '\0'; 
     fclose(f); 
     Value *v = create_string(j, b); 
@@ -825,7 +1021,8 @@ Value* builtin_read_file(JustState *j, Value **args, int count) {
     return v; 
 }
 
-Value* builtin_write_file(JustState *j, Value **args, int count) { 
+Value* builtin_write_file(JustState *j, Value **args, int count) {
+    if (!(j->capabilities & JUST_CAP_FILES)) { just_error(j, "File access disabled for this interpreter"); return create_bool(j, false); } 
     if (count < 2 || args[0]->type != TYPE_STRING || args[1]->type != TYPE_STRING) 
         return create_bool(j, false); 
     FILE *f = fopen(args[0]->data.string, "w"); 
@@ -857,6 +1054,7 @@ Value* builtin_json_parse(JustState *j, Value **args, int count) {
 }
 
 Value* builtin_http_get(JustState *j, Value **args, int count) {
+    if (!(j->capabilities & JUST_CAP_NET)) { just_error(j, "Network access disabled for this interpreter"); return create_value(j, TYPE_NULL); }
     if (count < 1 || args[0]->type != TYPE_STRING) return create_string(j, "");
 #ifdef _WIN32
     if (!j->winsock_initialized) { 
@@ -935,7 +1133,7 @@ Value* builtin_import_json(JustState *j, Value **args, int count) {
     long sz = ftell(f); 
     fseek(f, 0, SEEK_SET); 
     char *b = malloc(sz + 1); 
-    fread(b, 1, sz, f); 
+    size_t _rd = fread(b, 1, sz, f); (void)_rd;
     b[sz] = '\0'; 
     fclose(f); 
     const char *p = b; 
@@ -1003,15 +1201,18 @@ Value* builtin_sqrt(JustState *j, Value **args, int count) {
 }
 
 Value* builtin_random(JustState *j, Value **args, int count) { 
+    
     double max = count >= 1 ? value_to_number(args[0]) : 1.0; 
-    double r = (double)(rand() % 10000) / 10000.0; 
+    double span = 4294967296.0; 
+    double hi = (double)xorshift32(&j->rand_seed) / span;
+    double lo = (double)xorshift32(&j->rand_seed) / span;
+    double r = hi + lo / span;
+    if (r >= 1.0) r = 0.999999999999; 
     return create_number(j, r * max); 
 }
 
 Value* builtin_substr(JustState *j, Value **args, int count) {
-    /* FIX #9: substr(str, start[, length]) was missing entirely. Supports
-     * negative `start` to index from the end, like many scripting
-     * languages, and clamps out-of-range bounds instead of overrunning. */
+    
     if (count < 2 || args[0]->type != TYPE_STRING) return create_string(j, "");
     const char *s = args[0]->data.string;
     int len = (int)strlen(s);
@@ -1074,10 +1275,7 @@ Value* builtin_filter(JustState *j, Value **args, int count) {
 }
 
 Value* builtin_map(JustState *j, Value **args, int count) { 
-    /* FIX #2: previously required args[1]->type == TYPE_NATIVE_FUNC and
-     * called it directly, so a user-defined ("script") function could never
-     * be passed as the transform, and there was no way to even produce a
-     * function value from a bare function name in the first place. */
+    
     if (count < 2 || args[0]->type != TYPE_ARRAY ||
         (args[1]->type != TYPE_NATIVE_FUNC && args[1]->type != TYPE_FUNCTION))
         return create_array(j); 
@@ -1089,6 +1287,191 @@ Value* builtin_map(JustState *j, Value **args, int count) {
         array_push(result, mapped); 
     } 
     return result; 
+}
+
+Value* builtin_reduce(JustState *j, Value **args, int count) {
+    
+    if (count < 2 || args[0]->type != TYPE_ARRAY ||
+        (args[1]->type != TYPE_NATIVE_FUNC && args[1]->type != TYPE_FUNCTION))
+        return create_value(j, TYPE_NULL);
+    Value *acc;
+    int start = 0;
+    if (count >= 3) {
+        acc = args[2];
+    } else if (args[0]->data.array.count > 0) {
+        acc = args[0]->data.array.items[0];
+        start = 1;
+    } else {
+        return create_value(j, TYPE_NULL);
+    }
+    for (int i = start; i < args[0]->data.array.count; i++) {
+        Value *pair[2] = { acc, args[0]->data.array.items[i] };
+        acc = call_function_value(j, args[1], pair, 2);
+    }
+    return acc;
+}
+
+Value* builtin_find(JustState *j, Value **args, int count) {
+    
+    if (count < 2 || args[0]->type != TYPE_ARRAY ||
+        (args[1]->type != TYPE_NATIVE_FUNC && args[1]->type != TYPE_FUNCTION))
+        return create_value(j, TYPE_NULL);
+    for (int i = 0; i < args[0]->data.array.count; i++) {
+        Value *item = args[0]->data.array.items[i];
+        Value *cond = call_function_value(j, args[1], &item, 1);
+        if (value_to_bool(cond)) return item;
+    }
+    return create_value(j, TYPE_NULL);
+}
+
+Value* builtin_index_of(JustState *j, Value **args, int count) {
+    
+    if (count < 2) return create_number(j, -1);
+    if (args[0]->type == TYPE_ARRAY) {
+        for (int i = 0; i < args[0]->data.array.count; i++)
+            if (values_equal(args[0]->data.array.items[i], args[1])) return create_number(j, i);
+        return create_number(j, -1);
+    }
+    if (args[0]->type == TYPE_STRING && args[1]->type == TYPE_STRING) {
+        char *p = strstr(args[0]->data.string, args[1]->data.string);
+        return create_number(j, p ? (double)(p - args[0]->data.string) : -1);
+    }
+    return create_number(j, -1);
+}
+
+Value* builtin_includes(JustState *j, Value **args, int count) {
+    if (count < 2) return create_bool(j, false);
+    Value *idx = builtin_index_of(j, args, count);
+    return create_bool(j, value_to_number(idx) >= 0);
+}
+
+Value* builtin_slice(JustState *j, Value **args, int count) {
+    
+    if (count < 2) return create_value(j, TYPE_NULL);
+    if (args[0]->type == TYPE_ARRAY) {
+        int len = args[0]->data.array.count;
+        int start = normalize_index((int)value_to_number(args[1]), len);
+        int end = count >= 3 ? normalize_index((int)value_to_number(args[2]), len) : len;
+        if (start < 0) start = 0;
+        if (end > len) end = len;
+        Value *result = create_array(j);
+        for (int i = start; i < end; i++) array_push(result, args[0]->data.array.items[i]);
+        return result;
+    }
+    if (args[0]->type == TYPE_STRING) {
+        Value *sargs[3];
+        sargs[0] = args[0];
+        sargs[1] = args[1];
+        int n = 2;
+        if (count >= 3) {
+            int len = (int)strlen(args[0]->data.string);
+            int start = normalize_index((int)value_to_number(args[1]), len);
+            int end = normalize_index((int)value_to_number(args[2]), len);
+            sargs[2] = create_number(j, end - start > 0 ? end - start : 0);
+            n = 3;
+        }
+        return builtin_substr(j, sargs, n);
+    }
+    return create_value(j, TYPE_NULL);
+}
+
+Value* builtin_concat(JustState *j, Value **args, int count) {
+    
+    Value *result = create_array(j);
+    for (int a = 0; a < count; a++) {
+        if (args[a]->type != TYPE_ARRAY) continue;
+        for (int i = 0; i < args[a]->data.array.count; i++)
+            array_push(result, args[a]->data.array.items[i]);
+    }
+    return result;
+}
+
+Value* builtin_unique(JustState *j, Value **args, int count) {
+    
+    if (count < 1 || args[0]->type != TYPE_ARRAY) return create_array(j);
+    Value *result = create_array(j);
+    for (int i = 0; i < args[0]->data.array.count; i++) {
+        Value *item = args[0]->data.array.items[i];
+        bool seen = false;
+        for (int k = 0; k < result->data.array.count; k++) {
+            if (values_equal(result->data.array.items[k], item)) { seen = true; break; }
+        }
+        if (!seen) array_push(result, item);
+    }
+    return result;
+}
+
+Value* builtin_sum(JustState *j, Value **args, int count) {
+    if (count < 1 || args[0]->type != TYPE_ARRAY) return create_number(j, 0);
+    double total = 0;
+    for (int i = 0; i < args[0]->data.array.count; i++)
+        total += value_to_number(args[0]->data.array.items[i]);
+    return create_number(j, total);
+}
+
+Value* builtin_clamp(JustState *j, Value **args, int count) {
+    if (count < 3) return create_number(j, count >= 1 ? value_to_number(args[0]) : 0);
+    double v = value_to_number(args[0]), lo = value_to_number(args[1]), hi = value_to_number(args[2]);
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    return create_number(j, v);
+}
+
+Value* builtin_pad_start(JustState *j, Value **args, int count) {
+    
+    if (count < 2 || args[0]->type != TYPE_STRING) return create_string(j, "");
+    const char *s = args[0]->data.string;
+    int target = (int)value_to_number(args[1]);
+    char pad = (count >= 3 && args[2]->type == TYPE_STRING && args[2]->data.string[0]) ? args[2]->data.string[0] : ' ';
+    int len = (int)strlen(s);
+    if (len >= target) return create_string(j, s);
+    char *out = malloc((size_t)target + 1);
+    int padlen = target - len;
+    memset(out, pad, (size_t)padlen);
+    memcpy(out + padlen, s, (size_t)len + 1);
+    Value *v = create_string(j, out);
+    free(out);
+    return v;
+}
+
+Value* builtin_pad_end(JustState *j, Value **args, int count) {
+    if (count < 2 || args[0]->type != TYPE_STRING) return create_string(j, "");
+    const char *s = args[0]->data.string;
+    int target = (int)value_to_number(args[1]);
+    char pad = (count >= 3 && args[2]->type == TYPE_STRING && args[2]->data.string[0]) ? args[2]->data.string[0] : ' ';
+    int len = (int)strlen(s);
+    if (len >= target) return create_string(j, s);
+    char *out = malloc((size_t)target + 1);
+    memcpy(out, s, (size_t)len);
+    memset(out + len, pad, (size_t)(target - len));
+    out[target] = '\0';
+    Value *v = create_string(j, out);
+    free(out);
+    return v;
+}
+
+Value* builtin_merge(JustState *j, Value **args, int count) {
+    
+    Value *result = create_object(j);
+    for (int a = 0; a < count; a++) {
+        if (args[a]->type != TYPE_OBJECT) continue;
+        for (int i = 0; i < args[a]->data.object.count; i++)
+            object_set(result, args[a]->data.object.keys[i], args[a]->data.object.values[i]);
+    }
+    return result;
+}
+
+Value* builtin_entries(JustState *j, Value **args, int count) {
+    
+    if (count < 1 || args[0]->type != TYPE_OBJECT) return create_array(j);
+    Value *result = create_array(j);
+    for (int i = 0; i < args[0]->data.object.count; i++) {
+        Value *pair = create_array(j);
+        array_push(pair, create_string(j, args[0]->data.object.keys[i]));
+        array_push(pair, args[0]->data.object.values[i]);
+        array_push(result, pair);
+    }
+    return result;
 }
 
 Value* builtin_floor(JustState *j, Value **args, int count) { 
@@ -1107,6 +1490,7 @@ Value* builtin_round(JustState *j, Value **args, int count) {
 }
 
 Value* builtin_now(JustState *j, Value **args, int count) {
+    (void)args; (void)count; 
     time_t t = time(NULL);
     struct tm *tm = localtime(&t);
     char buf[128];
@@ -1122,6 +1506,7 @@ Value* builtin_now(JustState *j, Value **args, int count) {
 }
 
 Value* builtin_http_post(JustState *j, Value **args, int count) {
+    if (!(j->capabilities & JUST_CAP_NET)) { just_error(j, "Network access disabled for this interpreter"); return create_value(j, TYPE_NULL); }
     if (count < 2 || args[0]->type != TYPE_STRING || args[1]->type != TYPE_STRING) 
         return create_string(j, "");
 #ifdef _WIN32
@@ -1196,6 +1581,7 @@ Value* builtin_http_post(JustState *j, Value **args, int count) {
 }
 
 Value* builtin_exec(JustState *j, Value **args, int count) { 
+    if (!(j->capabilities & JUST_CAP_EXEC)) { just_error(j, "Shell exec disabled for this interpreter"); return create_string(j, ""); }
     if (count < 1 || args[0]->type != TYPE_STRING) return create_string(j, ""); 
     char *cmd = args[0]->data.string; 
     char buf[MAX_STRING]; 
@@ -1224,6 +1610,7 @@ Value* builtin_env(JustState *j, Value **args, int count) {
 }
 
 Value* builtin_color(JustState *j, Value **args, int count, const char *ansi_code, int win_color) {
+    (void)win_color; 
     if (count < 1 || args[0]->type != TYPE_STRING) return create_string(j, "");
     char *text = args[0]->data.string;
 #ifdef _WIN32
@@ -1270,13 +1657,15 @@ Value* builtin_task(JustState *j, Value **args, int count) {
         just_error(j, "Task not found"); 
         return create_value(j, TYPE_NULL); 
     } 
+    
+    int od = j->scope_depth;
     push_scope(j); 
     ControlFlow of = j->current_flow; 
     j->current_flow = FLOW_NORMAL; 
     j->return_value = NULL; 
     execute_block(j, f->body_start, f->body_end); 
-    j->current_flow = of; 
-    while (j->scope_depth > 0) pop_scope(j); 
+    if (j->current_flow != FLOW_ERROR) j->current_flow = of; 
+    while (j->scope_depth > od) pop_scope(j); 
     return create_value(j, TYPE_NULL); 
 }
 
@@ -1290,7 +1679,13 @@ Value* builtin_watch(JustState *j, Value **args, int count) {
     } 
     time_t last_modified = st.st_mtime; 
     printf("Watching: %s\n", filepath); 
-    while (1) { 
+    
+    long max_checks = j->max_iterations;
+    if (count >= 3) {
+        double mc = value_to_number(args[2]);
+        if (mc > 0) max_checks = (long)mc;
+    }
+    for (long iter = 0; iter < max_checks; iter++) { 
         just_sleep_ms(500); 
         if (stat(filepath, &st) == 0 && st.st_mtime != last_modified) { 
             last_modified = st.st_mtime; 
@@ -1304,19 +1699,27 @@ Value* builtin_watch(JustState *j, Value **args, int count) {
 }
 
 Value* builtin_error(JustState *j, Value **args, int count) { 
-    if (count >= 1 && args[0]->type == TYPE_STRING) 
-        just_error(j, args[0]->data.string); 
+    
+    const char *msg = (count >= 1 && args[0]->type == TYPE_STRING) ? args[0]->data.string : "error";
+    just_error(j, msg);
+    free(j->error_message);
+    j->error_message = str_dup(msg);
+    j->error_value = create_string(j, msg);
+    j->current_flow = FLOW_ERROR;
     return create_value(j, TYPE_NULL); 
 }
 
 Value* builtin_load_plugin(JustState *j, Value **args, int count) {
+    if (!(j->capabilities & JUST_CAP_PLUGIN)) { just_error(j, "Plugin loading disabled for this interpreter"); return create_bool(j, false); }
     if (count < 1 || args[0]->type != TYPE_STRING) return create_bool(j, false);
     char *name = args[0]->data.string;
     char fn[MAX_STRING];
     
-    // FIX #7: serialize the whole plugin_state critical section
+    
+
     plugin_lock_acquire();
-    // Сохраняем состояние для адаптера
+    
+
     plugin_state = j;
     
 #ifdef _WIN32
@@ -1417,10 +1820,12 @@ Value* builtin_trim(JustState *j, Value **args, int count) {
 }
 
 Value* builtin_read_json(JustState *j, Value **args, int count) { 
+    if (!(j->capabilities & JUST_CAP_FILES)) { just_error(j, "File access disabled for this interpreter"); return create_value(j, TYPE_NULL); }
     return builtin_import_json(j, args, count); 
 }
 
 Value* builtin_write_json(JustState *j, Value **args, int count) { 
+    if (!(j->capabilities & JUST_CAP_FILES)) { just_error(j, "File access disabled for this interpreter"); return create_bool(j, false); }
     if (count < 2 || args[0]->type != TYPE_STRING) return create_bool(j, false); 
     return builtin_json_export(j, args, count); 
 }
@@ -1745,7 +2150,13 @@ Value* builtin_dump(JustState *j, Value **args, int count) {
     return create_value(j, TYPE_NULL);
 }
 
+#ifndef JUST_NO_SQLITE
 Value* builtin_db_open(JustState *j, Value **args, int count) {
+    
+    if (!(j->capabilities & JUST_CAP_DB)) {
+        just_error(j, "Database access disabled for this interpreter");
+        return create_value(j, TYPE_NULL);
+    }
     if (count < 1 || args[0]->type != TYPE_STRING) {
         return create_value(j, TYPE_NULL);
     }
@@ -1759,7 +2170,7 @@ Value* builtin_db_open(JustState *j, Value **args, int count) {
         return create_value(j, TYPE_NULL);
     }
 
-    return create_number(j, (double)(intptr_t)db);
+    return create_number(j, handle_alloc(j, db));
 }
 
 Value* builtin_db_close(JustState *j, Value **args, int count) {
@@ -1767,8 +2178,10 @@ Value* builtin_db_close(JustState *j, Value **args, int count) {
         return create_value(j, TYPE_NULL);
     }
     
-    sqlite3 *db = (sqlite3*)(intptr_t)value_to_number(args[0]);
-    sqlite3_close(db);
+    int hid = (int)value_to_number(args[0]);
+    sqlite3 *db = (sqlite3*)handle_get(j, hid);
+    if (db) sqlite3_close(db);
+    handle_free(j, hid);
     return create_value(j, TYPE_NULL);
 }
 
@@ -1793,7 +2206,7 @@ Value* builtin_db_query(JustState *j, Value **args, int count) {
         return create_value(j, TYPE_NULL);
     }
     
-    sqlite3 *db = (sqlite3*)(intptr_t)value_to_number(args[0]);
+    sqlite3 *db = (sqlite3*)handle_get(j, (int)value_to_number(args[0]));
     const char *sql = args[1]->data.string;
     char *err = NULL;
     
@@ -1835,7 +2248,7 @@ Value* builtin_db_prepare(JustState *j, Value **args, int count) {
         return create_value(j, TYPE_NULL);
     }
     
-    sqlite3 *db = (sqlite3*)(intptr_t)value_to_number(args[0]);
+    sqlite3 *db = (sqlite3*)handle_get(j, (int)value_to_number(args[0]));
     sqlite3_stmt *stmt;
     const char *sql = args[1]->data.string;
     
@@ -1845,7 +2258,7 @@ Value* builtin_db_prepare(JustState *j, Value **args, int count) {
         return create_value(j, TYPE_NULL);
     }
     
-    return create_number(j, (double)(intptr_t)stmt);
+    return create_number(j, handle_alloc(j, stmt));
 }
 
 Value* builtin_db_bind(JustState *j, Value **args, int count) {
@@ -1853,7 +2266,7 @@ Value* builtin_db_bind(JustState *j, Value **args, int count) {
         return create_bool(j, false);
     }
     
-    sqlite3_stmt *stmt = (sqlite3_stmt*)(intptr_t)value_to_number(args[0]);
+    sqlite3_stmt *stmt = (sqlite3_stmt*)handle_get(j, (int)value_to_number(args[0]));
     int idx = (int)value_to_number(args[1]);
     Value *val = args[2];
     
@@ -1883,7 +2296,7 @@ Value* builtin_db_step(JustState *j, Value **args, int count) {
         return create_value(j, TYPE_NULL);
     }
     
-    sqlite3_stmt *stmt = (sqlite3_stmt*)(intptr_t)value_to_number(args[0]);
+    sqlite3_stmt *stmt = (sqlite3_stmt*)handle_get(j, (int)value_to_number(args[0]));
     int rc = sqlite3_step(stmt);
     
     if (rc == SQLITE_ROW) {
@@ -1926,8 +2339,10 @@ Value* builtin_db_finalize(JustState *j, Value **args, int count) {
         return create_value(j, TYPE_NULL);
     }
     
-    sqlite3_stmt *stmt = (sqlite3_stmt*)(intptr_t)value_to_number(args[0]);
-    sqlite3_finalize(stmt);
+    int hid = (int)value_to_number(args[0]);
+    sqlite3_stmt *stmt = (sqlite3_stmt*)handle_get(j, hid);
+    if (stmt) sqlite3_finalize(stmt);
+    handle_free(j, hid);
     return create_value(j, TYPE_NULL);
 }
 
@@ -1936,7 +2351,7 @@ Value* builtin_db_last_insert_id(JustState *j, Value **args, int count) {
         return create_number(j, 0);
     }
     
-    sqlite3 *db = (sqlite3*)(intptr_t)value_to_number(args[0]);
+    sqlite3 *db = (sqlite3*)handle_get(j, (int)value_to_number(args[0]));
     return create_number(j, sqlite3_last_insert_rowid(db));
 }
 
@@ -1945,7 +2360,7 @@ Value* builtin_db_changes(JustState *j, Value **args, int count) {
         return create_number(j, 0);
     }
     
-    sqlite3 *db = (sqlite3*)(intptr_t)value_to_number(args[0]);
+    sqlite3 *db = (sqlite3*)handle_get(j, (int)value_to_number(args[0]));
     return create_number(j, sqlite3_changes(db));
 }
 
@@ -1954,7 +2369,7 @@ Value* builtin_db_begin(JustState *j, Value **args, int count) {
         return create_bool(j, false);
     }
     
-    sqlite3 *db = (sqlite3*)(intptr_t)value_to_number(args[0]);
+    sqlite3 *db = (sqlite3*)handle_get(j, (int)value_to_number(args[0]));
     char *err = NULL;
     int rc = sqlite3_exec(db, "BEGIN TRANSACTION", NULL, NULL, &err);
     
@@ -1972,7 +2387,7 @@ Value* builtin_db_commit(JustState *j, Value **args, int count) {
         return create_bool(j, false);
     }
     
-    sqlite3 *db = (sqlite3*)(intptr_t)value_to_number(args[0]);
+    sqlite3 *db = (sqlite3*)handle_get(j, (int)value_to_number(args[0]));
     char *err = NULL;
     int rc = sqlite3_exec(db, "COMMIT", NULL, NULL, &err);
     
@@ -1990,7 +2405,7 @@ Value* builtin_db_rollback(JustState *j, Value **args, int count) {
         return create_bool(j, false);
     }
     
-    sqlite3 *db = (sqlite3*)(intptr_t)value_to_number(args[0]);
+    sqlite3 *db = (sqlite3*)handle_get(j, (int)value_to_number(args[0]));
     char *err = NULL;
     int rc = sqlite3_exec(db, "ROLLBACK", NULL, NULL, &err);
     
@@ -2008,10 +2423,11 @@ Value* builtin_db_error(JustState *j, Value **args, int count) {
         return create_string(j, "");
     }
     
-    sqlite3 *db = (sqlite3*)(intptr_t)value_to_number(args[0]);
+    sqlite3 *db = (sqlite3*)handle_get(j, (int)value_to_number(args[0]));
     const char *err = sqlite3_errmsg(db);
     return create_string(j, err ? err : "");
 }
+#endif 
 
 Value* builtin_gc_get_count(JustState *j, Value **args, int count) {
     (void)args; (void)count;
@@ -2094,6 +2510,19 @@ void register_builtins(JustState *j) {
     add_native_func(j, "load_plugin", builtin_load_plugin);
     add_native_func(j, "filter", builtin_filter); 
     add_native_func(j, "map", builtin_map);
+    add_native_func(j, "reduce", builtin_reduce);
+    add_native_func(j, "find", builtin_find);
+    add_native_func(j, "index_of", builtin_index_of);
+    add_native_func(j, "includes", builtin_includes);
+    add_native_func(j, "slice", builtin_slice);
+    add_native_func(j, "concat", builtin_concat);
+    add_native_func(j, "unique", builtin_unique);
+    add_native_func(j, "sum", builtin_sum);
+    add_native_func(j, "clamp", builtin_clamp);
+    add_native_func(j, "pad_start", builtin_pad_start);
+    add_native_func(j, "pad_end", builtin_pad_end);
+    add_native_func(j, "merge", builtin_merge);
+    add_native_func(j, "entries", builtin_entries);
     add_native_func(j, "task", builtin_task); 
     add_native_func(j, "watch", builtin_watch);
     add_native_func(j, "error", builtin_error);
@@ -2130,6 +2559,7 @@ void register_builtins(JustState *j) {
 	add_native_func(j, "last", builtin_last);
 	add_native_func(j, "reverse", builtin_reverse);
 	add_native_func(j, "sort", builtin_sort);
+#ifndef JUST_NO_SQLITE
 	add_native_func(j, "db_open", builtin_db_open);
     add_native_func(j, "db_close", builtin_db_close);
     add_native_func(j, "db_query", builtin_db_query);
@@ -2144,12 +2574,14 @@ void register_builtins(JustState *j) {
 	add_native_func(j, "db_commit", builtin_db_commit);
 	add_native_func(j, "db_rollback", builtin_db_rollback);
 	add_native_func(j, "db_error", builtin_db_error);
+#endif 
 	add_native_func(j, "substr", builtin_substr);
 	add_native_func(j, "gc_get_count", builtin_gc_get_count);
 	add_native_func(j, "gc_get_allocations", builtin_gc_get_allocations);
 }
 
-// Tokenizer
+
+
 void tokenize(JustState *j, const char *src) {
     j->current_line = 1;
     if ((unsigned char)src[0] == 0xEF && (unsigned char)src[1] == 0xBB && (unsigned char)src[2] == 0xBF) 
@@ -2158,10 +2590,12 @@ void tokenize(JustState *j, const char *src) {
         for (int i = 0; i < j->token_count; i++) free(j->tokens[i]); 
         free(j->tokens); 
     }
+    free(j->token_lines);
     j->tokens = NULL; 
     j->token_count = 0; 
     j->token_capacity = 256;
     j->tokens = malloc(sizeof(char*) * j->token_capacity);
+    j->token_lines = malloc(sizeof(int) * j->token_capacity);
     const char *p = src;
     while (*p) {
         while (*p && isspace(*p)) { 
@@ -2209,12 +2643,15 @@ void tokenize(JustState *j, const char *src) {
             free(s);
             if (j->token_count >= j->token_capacity) { 
                 j->token_capacity *= 2; 
+                j->token_lines = realloc(j->token_lines, sizeof(int) * j->token_capacity); 
                 j->tokens = realloc(j->tokens, sizeof(char*) * j->token_capacity); 
             }
-            if (j->token_count >= MAX_TOKENS) { 
-                just_error(j, "Too many tokens"); 
-                exit(1); 
+            if (j->token_count >= j->max_tokens) { 
+                
+                j->token_limit_hit = true; 
+                return; 
             }
+            j->token_lines[j->token_count] = j->current_line; 
             j->tokens[j->token_count++] = t; 
             continue;
         }
@@ -2224,12 +2661,15 @@ void tokenize(JustState *j, const char *src) {
             t[0]='='; t[1]='='; t[2]='='; t[3]='\0'; 
             if (j->token_count >= j->token_capacity) { 
                 j->token_capacity *= 2; 
+                j->token_lines = realloc(j->token_lines, sizeof(int) * j->token_capacity); 
                 j->tokens = realloc(j->tokens, sizeof(char*) * j->token_capacity); 
             }
-            if (j->token_count >= MAX_TOKENS) { 
-                just_error(j, "Too many tokens"); 
-                exit(1); 
+            if (j->token_count >= j->max_tokens) { 
+                
+                j->token_limit_hit = true; 
+                return; 
             }
+            j->token_lines[j->token_count] = j->current_line; 
             j->tokens[j->token_count++] = t; 
             p += 3; 
             continue; 
@@ -2239,12 +2679,15 @@ void tokenize(JustState *j, const char *src) {
             t[0]='!'; t[1]='='; t[2]='='; t[3]='\0'; 
             if (j->token_count >= j->token_capacity) { 
                 j->token_capacity *= 2; 
+                j->token_lines = realloc(j->token_lines, sizeof(int) * j->token_capacity); 
                 j->tokens = realloc(j->tokens, sizeof(char*) * j->token_capacity); 
             }
-            if (j->token_count >= MAX_TOKENS) { 
-                just_error(j, "Too many tokens"); 
-                exit(1); 
+            if (j->token_count >= j->max_tokens) { 
+                
+                j->token_limit_hit = true; 
+                return; 
             }
+            j->token_lines[j->token_count] = j->current_line; 
             j->tokens[j->token_count++] = t; 
             p += 3; 
             continue; 
@@ -2255,15 +2698,37 @@ void tokenize(JustState *j, const char *src) {
             t[0]='*'; t[1]='*'; t[2]='\0'; 
             if (j->token_count >= j->token_capacity) { 
                 j->token_capacity *= 2; 
+                j->token_lines = realloc(j->token_lines, sizeof(int) * j->token_capacity); 
                 j->tokens = realloc(j->tokens, sizeof(char*) * j->token_capacity); 
             }
-            if (j->token_count >= MAX_TOKENS) { 
-                just_error(j, "Too many tokens"); 
-                exit(1); 
+            if (j->token_count >= j->max_tokens) { 
+                
+                j->token_limit_hit = true; 
+                return; 
             }
+            j->token_lines[j->token_count] = j->current_line; 
             j->tokens[j->token_count++] = t; 
             p += 2; 
             continue; 
+        }
+        
+        if ((p[0]=='&'&&p[1]=='&')||(p[0]=='|'&&p[1]=='|')) {
+            char *t = malloc(3); 
+            t[0]=p[0]; t[1]=p[1]; t[2]='\0';
+            if (j->token_count >= j->token_capacity) { 
+                j->token_capacity *= 2; 
+                j->token_lines = realloc(j->token_lines, sizeof(int) * j->token_capacity); 
+                j->tokens = realloc(j->tokens, sizeof(char*) * j->token_capacity); 
+            }
+            if (j->token_count >= j->max_tokens) { 
+                
+                j->token_limit_hit = true; 
+                return; 
+            }
+            j->token_lines[j->token_count] = j->current_line; 
+            j->tokens[j->token_count++] = t; 
+            p += 2; 
+            continue;
         }
         
         if ((p[0]=='='&&p[1]=='=')||(p[0]=='!'&&p[1]=='=')||(p[0]=='<'&&p[1]=='=')||(p[0]=='>'&&p[1]=='=')||(p[0]=='+'&&p[1]=='=')||(p[0]=='-'&&p[1]=='=')) {
@@ -2271,12 +2736,15 @@ void tokenize(JustState *j, const char *src) {
             t[0]=p[0]; t[1]=p[1]; t[2]='\0';
             if (j->token_count >= j->token_capacity) { 
                 j->token_capacity *= 2; 
+                j->token_lines = realloc(j->token_lines, sizeof(int) * j->token_capacity); 
                 j->tokens = realloc(j->tokens, sizeof(char*) * j->token_capacity); 
             }
-            if (j->token_count >= MAX_TOKENS) { 
-                just_error(j, "Too many tokens"); 
-                exit(1); 
+            if (j->token_count >= j->max_tokens) { 
+                
+                j->token_limit_hit = true; 
+                return; 
             }
+            j->token_lines[j->token_count] = j->current_line; 
             j->tokens[j->token_count++] = t; 
             p += 2; 
             continue;
@@ -2287,12 +2755,15 @@ void tokenize(JustState *j, const char *src) {
             t[0]=*p; t[1]='\0';
             if (j->token_count >= j->token_capacity) { 
                 j->token_capacity *= 2; 
+                j->token_lines = realloc(j->token_lines, sizeof(int) * j->token_capacity); 
                 j->tokens = realloc(j->tokens, sizeof(char*) * j->token_capacity); 
             }
-            if (j->token_count >= MAX_TOKENS) { 
-                just_error(j, "Too many tokens"); 
-                exit(1); 
+            if (j->token_count >= j->max_tokens) { 
+                
+                j->token_limit_hit = true; 
+                return; 
             }
+            j->token_lines[j->token_count] = j->current_line; 
             j->tokens[j->token_count++] = t; 
             p++; 
             continue;
@@ -2313,12 +2784,15 @@ void tokenize(JustState *j, const char *src) {
             t[l] = '\0';
             if (j->token_count >= j->token_capacity) { 
                 j->token_capacity *= 2; 
+                j->token_lines = realloc(j->token_lines, sizeof(int) * j->token_capacity); 
                 j->tokens = realloc(j->tokens, sizeof(char*) * j->token_capacity); 
             }
-            if (j->token_count >= MAX_TOKENS) { 
-                just_error(j, "Too many tokens"); 
-                exit(1); 
+            if (j->token_count >= j->max_tokens) { 
+                
+                j->token_limit_hit = true; 
+                return; 
             }
+            j->token_lines[j->token_count] = j->current_line; 
             j->tokens[j->token_count++] = t; 
             continue;
         }
@@ -2427,6 +2901,40 @@ Value* eval_primary(JustState *j, int *pos) {
         return create_bool(j, !b); 
     } 
     
+    if (strcmp(t, "func") == 0 && *pos + 1 < j->token_count && strcmp(j->tokens[*pos + 1], "(") == 0) {
+        
+        (*pos)++; 
+        (*pos)++; 
+        char *params[MAX_ARGS]; 
+        int pc = 0; 
+        while (*pos < j->token_count && strcmp(j->tokens[*pos], ")") != 0) { 
+            if (pc > 0 && strcmp(j->tokens[*pos], ",") == 0) (*pos)++; 
+            if (*pos < j->token_count && strcmp(j->tokens[*pos], ")") != 0) 
+                params[pc++] = j->tokens[(*pos)++]; 
+        } 
+        if (*pos < j->token_count) (*pos)++; 
+        while (*pos < j->token_count && strcmp(j->tokens[*pos], "{") != 0) (*pos)++; 
+        if (*pos >= j->token_count) return create_value(j, TYPE_NULL); 
+        (*pos)++; 
+        int bs = *pos, d = 1; 
+        while (*pos < j->token_count && d > 0) { 
+            if (strcmp(j->tokens[*pos], "{") == 0) d++; 
+            else if (strcmp(j->tokens[*pos], "}") == 0) d--; 
+            (*pos)++; 
+        } 
+        int be = *pos - 1; 
+
+        Value *fv = create_value(j, TYPE_FUNCTION);
+        fv->is_lambda = true;
+        fv->data.lambda.body_start = bs;
+        fv->data.lambda.body_end = be;
+        fv->data.lambda.param_count = pc;
+        fv->data.lambda.params = malloc(sizeof(char*) * (pc > 0 ? pc : 1));
+        for (int i = 0; i < pc; i++) fv->data.lambda.params[i] = str_dup(params[i]);
+        fv->data.lambda.captured = capture_scope(j);
+        return fv;
+    }
+
     if (isalpha(t[0]) || t[0] == '_') { 
         if (*pos + 1 < j->token_count && strcmp(j->tokens[*pos + 1], "(") == 0) { 
             char *fn = t; 
@@ -2445,17 +2953,29 @@ Value* eval_primary(JustState *j, int *pos) {
 					Value *r = f->native_func(j, args, ac); 
 					return r; 
 				}
+                if (j->call_depth >= j->max_call_depth) {
+                    just_error(j, "Maximum call stack size exceeded");
+                    free(j->error_message);
+                    j->error_message = str_dup("Maximum call stack size exceeded");
+                    j->error_value = create_string(j, "Maximum call stack size exceeded");
+                    j->current_flow = FLOW_ERROR;
+                    return create_value(j, TYPE_NULL);
+                }
+                j->call_stack[j->call_depth] = f->name;
+                j->call_depth++;
+                
+                int od = j->scope_depth; 
                 push_scope(j); 
                 for (int i = 0; i < f->param_count && i < ac; i++) 
-                    set_var(j, f->params[i], args[i], false); 
-                int od = j->scope_depth; 
+                    declare_var(j, f->params[i], args[i], false); 
                 ControlFlow of = j->current_flow; 
                 j->current_flow = FLOW_NORMAL; 
                 j->return_value = NULL; 
                 execute_block(j, f->body_start, f->body_end); 
-                j->current_flow = of; 
+                if (j->current_flow != FLOW_ERROR) j->current_flow = of; 
                 Value *saved_return = j->return_value;
                 while (j->scope_depth > od) pop_scope(j);
+                j->call_depth--;
                 Value *r = saved_return ? saved_return : create_value(j, TYPE_NULL);
                 if (saved_return) { 
                     saved_return = NULL; 
@@ -2463,17 +2983,18 @@ Value* eval_primary(JustState *j, int *pos) {
                 }
                 return r;
             } 
+            
+            Variable *cv = find_var(j, fn);
+            if (cv && cv->value && (cv->value->type == TYPE_FUNCTION || cv->value->type == TYPE_NATIVE_FUNC)) {
+                return call_function_value(j, cv->value, args, ac);
+            }
             return create_value(j, TYPE_NULL); 
         } 
         (*pos)++; 
 		Variable *v = find_var(j, t); 
 		if (v) return v->value; 
 
-		/* FIX #1/#2 (first-class functions): a bare function name used to
-		 * always fall through to null here, which is exactly why
-		 * filter()/map() had no way to receive a predicate/transform
-		 * function -- there was no way to produce a function *value* from
-		 * an identifier at all. Now it resolves to a callable value. */
+		
 		Function *fref = find_func(j, t);
 		if (fref) {
 			if (fref->is_native) {
@@ -2534,8 +3055,29 @@ Value* eval_multiplicative(JustState *j, int *pos) {
         Value *r = eval_postfix(j, pos); 
         double a = value_to_number(l), b = value_to_number(r), res = 0; 
         if (strcmp(op,"*")==0) res=a*b; 
-        else if (strcmp(op,"/")==0) res=b!=0?a/b:0; 
-        else res=b!=0?fmod(a,b):0; 
+        else if (strcmp(op,"/")==0) {
+            if (b == 0) {
+                
+                just_error(j, "Division by zero");
+                free(j->error_message);
+                j->error_message = str_dup("Division by zero");
+                j->error_value = create_string(j, "Division by zero");
+                j->current_flow = FLOW_ERROR;
+                return create_value(j, TYPE_NULL);
+            }
+            res = a / b;
+        }
+        else {
+            if (b == 0) {
+                just_error(j, "Modulo by zero");
+                free(j->error_message);
+                j->error_message = str_dup("Modulo by zero");
+                j->error_value = create_string(j, "Modulo by zero");
+                j->current_flow = FLOW_ERROR;
+                return create_value(j, TYPE_NULL);
+            }
+            res = fmod(a, b);
+        }
         l = create_number(j, res); 
     } 
     return l; 
@@ -2575,14 +3117,24 @@ Value* eval_comparison(JustState *j, int *pos) {
         Value *r = eval_additive(j, pos);
         bool res = false;
         if (strcmp(op,"===")==0) {
-            res = (l->type == r->type && value_to_number(l) == value_to_number(r));
+            
+            res = (l->type == r->type && values_equal(l, r));
         } else if (strcmp(op,"!==")==0) {
-            res = !(l->type == r->type && value_to_number(l) == value_to_number(r));
+            res = !(l->type == r->type && values_equal(l, r));
+        } else if (strcmp(op,"==")==0) {
+            res = values_equal(l, r);
+        } else if (strcmp(op,"!=")==0) {
+            res = !values_equal(l, r);
+        } else if (l->type == TYPE_STRING && r->type == TYPE_STRING) {
+            
+            int c = strcmp(l->data.string, r->data.string);
+            if (strcmp(op,"<")==0) res = c < 0;
+            else if (strcmp(op,">")==0) res = c > 0;
+            else if (strcmp(op,"<=")==0) res = c <= 0;
+            else res = c >= 0;
         } else {
             double a = value_to_number(l), b = value_to_number(r);
-            if (strcmp(op,"==")==0) res=a==b;
-            else if (strcmp(op,"!=")==0) res=a!=b;
-            else if (strcmp(op,"<")==0) res=a<b;
+            if (strcmp(op,"<")==0) res=a<b;
             else if (strcmp(op,">")==0) res=a>b;
             else if (strcmp(op,"<=")==0) res=a<=b;
             else res=a>=b;
@@ -2594,7 +3146,7 @@ Value* eval_comparison(JustState *j, int *pos) {
 
 Value* eval_logical_and(JustState *j, int *pos) { 
     Value *l = eval_comparison(j, pos); 
-    while (*pos < j->token_count && strcmp(j->tokens[*pos],"and")==0) { 
+    while (*pos < j->token_count && (strcmp(j->tokens[*pos],"and")==0 || strcmp(j->tokens[*pos],"&&")==0)) { 
         (*pos)++; 
         Value *r = eval_comparison(j, pos); 
         bool b = value_to_bool(l) && value_to_bool(r); 
@@ -2605,7 +3157,7 @@ Value* eval_logical_and(JustState *j, int *pos) {
 
 Value* eval_logical_or(JustState *j, int *pos) { 
     Value *l = eval_logical_and(j, pos); 
-    while (*pos < j->token_count && strcmp(j->tokens[*pos],"or")==0) { 
+    while (*pos < j->token_count && (strcmp(j->tokens[*pos],"or")==0 || strcmp(j->tokens[*pos],"||")==0)) { 
         (*pos)++; 
         Value *r = eval_logical_and(j, pos); 
         bool b = value_to_bool(l) || value_to_bool(r); 
@@ -2618,21 +3170,37 @@ Value* eval_expression(JustState *j, int *pos) {
     return eval_logical_or(j, pos); 
 }
 
-Value* just_number(double n) { 
-    JustState dummy = {0};
-    return create_number(&dummy, n); 
+
+Value* just_number(double n) {
+    Value *v = calloc(1, sizeof(Value));
+    if (!v) return NULL;
+    v->type = TYPE_NUMBER;
+    v->data.number = n;
+    v->marked = true;
+    return v;
 }
-Value* just_string(const char *s) { 
-    JustState dummy = {0};
-    return create_string(&dummy, s); 
+Value* just_string(const char *s) {
+    Value *v = calloc(1, sizeof(Value));
+    if (!v) return NULL;
+    v->type = TYPE_STRING;
+    v->data.string = s ? str_dup(s) : str_dup("");
+    v->marked = true;
+    return v;
 }
-Value* just_bool(bool b) { 
-    JustState dummy = {0};
-    return create_bool(&dummy, b); 
+Value* just_bool(bool b) {
+    Value *v = calloc(1, sizeof(Value));
+    if (!v) return NULL;
+    v->type = TYPE_BOOL;
+    v->data.boolean = b;
+    v->marked = true;
+    return v;
 }
-Value* just_null(void) { 
-    JustState dummy = {0};
-    return create_value(&dummy, TYPE_NULL); 
+Value* just_null(void) {
+    Value *v = calloc(1, sizeof(Value));
+    if (!v) return NULL;
+    v->type = TYPE_NULL;
+    v->marked = true;
+    return v;
 }
 double just_as_number(Value *v) { return value_to_number(v); }
 const char* just_as_string(Value *v) { 
@@ -2650,24 +3218,31 @@ int execute_block(JustState *j, int start, int end) {
 
 int tokenize_append(JustState *j, const char *src) {
     char **old_tokens = j->tokens;
+    int *old_lines = j->token_lines;
     int old_count = j->token_count;
 
     j->tokens = NULL;
+    j->token_lines = NULL;
     j->token_count = 0;
     j->token_capacity = 0;
     tokenize(j, src);
 
     char **new_tokens = j->tokens;
+    int *new_lines = j->token_lines;
     int new_count = j->token_count;
 
     int total = old_count + new_count;
     char **merged = malloc(sizeof(char*) * (total > 0 ? total : 1));
-    for (int i = 0; i < old_count; i++) merged[i] = old_tokens[i];
-    for (int i = 0; i < new_count; i++) merged[old_count + i] = new_tokens[i];
+    int *merged_lines = malloc(sizeof(int) * (total > 0 ? total : 1));
+    for (int i = 0; i < old_count; i++) { merged[i] = old_tokens[i]; merged_lines[i] = old_lines[i]; }
+    for (int i = 0; i < new_count; i++) { merged[old_count + i] = new_tokens[i]; merged_lines[old_count + i] = new_lines[i]; }
     free(old_tokens);
+    free(old_lines);
     free(new_tokens);
+    free(new_lines);
 
     j->tokens = merged;
+    j->token_lines = merged_lines;
     j->token_count = total;
     j->token_capacity = total > 0 ? total : 1;
     return old_count;
@@ -2675,6 +3250,10 @@ int tokenize_append(JustState *j, const char *src) {
 
 int execute_statement(JustState *j, int pos) { 
     if (pos >= j->token_count) return pos; 
+    
+    if (j->call_depth == 0 && j->total_allocations >= j->gc_threshold) gc_collect(j);
+    
+    if (j->token_lines) j->current_line = j->token_lines[pos];
     char *cmd = j->tokens[pos]; 
     
     if (strcmp(cmd, ";") == 0) return pos + 1; 
@@ -2684,7 +3263,27 @@ int execute_statement(JustState *j, int pos) {
         if (pos < j->token_count && strcmp(j->tokens[pos], ";") != 0) { 
             j->return_value = eval_expression(j, &pos); 
         } 
-        j->current_flow = FLOW_RETURN; 
+        
+        if (j->current_flow != FLOW_ERROR) j->current_flow = FLOW_RETURN; 
+        return pos; 
+    } 
+    
+    if (strcmp(cmd, "throw") == 0) { 
+        pos++; 
+        Value *v = create_value(j, TYPE_NULL);
+        if (pos < j->token_count && strcmp(j->tokens[pos], ";") != 0) { 
+            v = eval_expression(j, &pos); 
+        } 
+        if (j->current_flow != FLOW_ERROR) { 
+            
+            char *msg = just_to_string(j, v); 
+            just_error(j, msg ? msg : "thrown error"); 
+            free(j->error_message); 
+            j->error_message = str_dup(msg ? msg : "thrown error"); 
+            free(msg); 
+            j->error_value = v; 
+            j->current_flow = FLOW_ERROR; 
+        } 
         return pos; 
     } 
     
@@ -2751,9 +3350,120 @@ int execute_statement(JustState *j, int pos) {
         if (pos < j->token_count && strcmp(j->tokens[pos], "=") == 0) { 
             pos++; 
             Value *v = eval_expression(j, &pos); 
-            set_var(j, vn, v, ic); 
+            declare_var(j, vn, v, ic); 
             return pos; 
         } 
+        return pos; 
+    } 
+    
+    if (strcmp(cmd, "try") == 0) { 
+        pos++; 
+        while (pos < j->token_count && strcmp(j->tokens[pos], "{") != 0) pos++; 
+        if (pos >= j->token_count) return pos; 
+        pos++; 
+        int bs = pos, d = 1; 
+        while (pos < j->token_count && d > 0) { 
+            if (strcmp(j->tokens[pos], "{") == 0) d++; 
+            else if (strcmp(j->tokens[pos], "}") == 0) d--; 
+            pos++; 
+        } 
+        int be = pos - 1; 
+
+        char *catch_var = NULL; 
+        int cs = 0, ce = 0; 
+        bool has_catch = false; 
+        if (pos < j->token_count && strcmp(j->tokens[pos], "catch") == 0) { 
+            has_catch = true; 
+            pos++; 
+            if (pos < j->token_count && strcmp(j->tokens[pos], "(") == 0) { 
+                pos++; 
+                if (pos < j->token_count && strcmp(j->tokens[pos], ")") != 0) 
+                    catch_var = j->tokens[pos++]; 
+                if (pos < j->token_count && strcmp(j->tokens[pos], ")") == 0) pos++; 
+            } 
+            while (pos < j->token_count && strcmp(j->tokens[pos], "{") != 0) pos++; 
+            if (pos >= j->token_count) return pos; 
+            pos++; 
+            cs = pos; 
+            int d2 = 1; 
+            while (pos < j->token_count && d2 > 0) { 
+                if (strcmp(j->tokens[pos], "{") == 0) d2++; 
+                else if (strcmp(j->tokens[pos], "}") == 0) d2--; 
+                pos++; 
+            } 
+            ce = pos - 1; 
+        } 
+
+        
+        bool has_finally = false; 
+        int fs = 0, fe = 0; 
+        if (pos < j->token_count && strcmp(j->tokens[pos], "finally") == 0) { 
+            has_finally = true; 
+            pos++; 
+            while (pos < j->token_count && strcmp(j->tokens[pos], "{") != 0) pos++; 
+            if (pos >= j->token_count) return pos; 
+            pos++; 
+            fs = pos; 
+            int d3 = 1; 
+            while (pos < j->token_count && d3 > 0) { 
+                if (strcmp(j->tokens[pos], "{") == 0) d3++; 
+                else if (strcmp(j->tokens[pos], "}") == 0) d3--; 
+                pos++; 
+            } 
+            fe = pos - 1; 
+        } 
+
+        push_scope(j); 
+        j->current_flow = FLOW_NORMAL; 
+        execute_block(j, bs, be); 
+        bool errored = (j->current_flow == FLOW_ERROR); 
+        if (errored) j->current_flow = FLOW_NORMAL; 
+        if (j->scope_depth > 0) pop_scope(j); 
+
+        if (errored && has_catch) { 
+            push_scope(j); 
+            if (catch_var) { 
+                
+                Value *ev = j->error_value ? j->error_value : create_string(j, j->error_message ? j->error_message : "error"); 
+                declare_var(j, catch_var, ev, false); 
+            } 
+            free(j->error_message); 
+            j->error_message = NULL; 
+            j->error_value = NULL; 
+            j->current_flow = FLOW_NORMAL; 
+            execute_block(j, cs, ce); 
+            if (j->scope_depth > 0) pop_scope(j); 
+        } else if (errored) { 
+             
+            j->current_flow = FLOW_ERROR; 
+        } 
+
+        if (has_finally) { 
+            
+            ControlFlow pending_flow = j->current_flow; 
+            Value *pending_return = j->return_value; 
+            char *pending_err_msg = j->error_message; 
+            Value *pending_err_val = j->error_value; 
+            j->error_message = NULL; 
+            j->error_value = NULL; 
+
+            push_scope(j); 
+            j->current_flow = FLOW_NORMAL; 
+            j->return_value = NULL; 
+            execute_block(j, fs, fe); 
+            bool finally_errored = (j->current_flow == FLOW_ERROR); 
+            if (j->scope_depth > 0) pop_scope(j); 
+
+            if (!finally_errored) { 
+                j->current_flow = pending_flow; 
+                j->return_value = pending_return; 
+                j->error_message = pending_err_msg; 
+                j->error_value = pending_err_val; 
+            } else { 
+                free(pending_err_msg); 
+            } 
+        } 
+
         return pos; 
     } 
     
@@ -2841,7 +3551,7 @@ int execute_statement(JustState *j, int pos) {
             pos++; 
         } 
         int be = pos - 1; 
-        for (int lc = 0; lc < MAX_ITERATIONS; lc++) { 
+        for (int lc = 0; lc < j->max_iterations; lc++) { 
             int chp = cp; 
             Value *c = eval_expression(j, &chp); 
             bool cond = value_to_bool(c); 
@@ -2857,6 +3567,10 @@ int execute_statement(JustState *j, int pos) {
                 j->current_flow = FLOW_NORMAL; 
                 continue; 
             } 
+            if (j->current_flow != FLOW_NORMAL) {
+                
+                break;
+            }
             j->current_flow = of; 
         } 
         return pos; 
@@ -2928,7 +3642,7 @@ int execute_statement(JustState *j, int pos) {
 			}
 		}
 		
-		for (int lc = 0; lc < MAX_ITERATIONS; lc++) { 
+		for (int lc = 0; lc < j->max_iterations; lc++) { 
 			int chp = cp; 
 			Value *c = eval_expression(j, &chp); 
 			bool cond = value_to_bool(c); 
@@ -2950,6 +3664,10 @@ int execute_statement(JustState *j, int pos) {
 				j->current_flow = fi2; 
 				continue; 
 			} 
+			if (j->current_flow != FLOW_NORMAL) {
+				
+				break;
+			}
 			j->current_flow = of; 
 			
 			ControlFlow fi2 = j->current_flow; 
@@ -2998,7 +3716,7 @@ int execute_statement(JustState *j, int pos) {
             pos + 1 < j->token_count && strcmp(j->tokens[pos + 1], "[") == 0) {
             pos += 2;
             Value *idx_val = eval_expression(j, &pos);
-            int idx = (int)value_to_number(idx_val);
+            int idx = normalize_index((int)value_to_number(idx_val), var->value->data.array.count);
             
             if (pos < j->token_count && strcmp(j->tokens[pos], "]") == 0) {
                 pos++;
@@ -3106,20 +3824,49 @@ int execute_statement(JustState *j, int pos) {
             if (pos < j->token_count) pos++;
             if (f->is_native) {
                 Value *r = f->native_func(j, args, ac);
+                (void)r; 
             } else {
+                if (j->call_depth >= j->max_call_depth) {
+                    just_error(j, "Maximum call stack size exceeded");
+                    free(j->error_message);
+                    j->error_message = str_dup("Maximum call stack size exceeded");
+                    j->error_value = create_string(j, "Maximum call stack size exceeded");
+                    j->current_flow = FLOW_ERROR;
+                    return pos;
+                }
+                j->call_stack[j->call_depth] = f->name;
+                j->call_depth++;
+                
+                int od = j->scope_depth;
                 push_scope(j);
                 for (int i = 0; i < f->param_count && i < ac; i++) 
-                    set_var(j, f->params[i], args[i], false);
-                int od = j->scope_depth;
+                    declare_var(j, f->params[i], args[i], false);
                 ControlFlow of = j->current_flow;
                 j->current_flow = FLOW_NORMAL;
                 j->return_value = NULL;
                 execute_block(j, f->body_start, f->body_end);
-                j->current_flow = of;
+                if (j->current_flow != FLOW_ERROR) j->current_flow = of;
                 while (j->scope_depth > od) pop_scope(j);
+                j->call_depth--;
                 Value *r = j->return_value ? j->return_value : create_value(j, TYPE_NULL);
+                (void)r; 
                 if (j->return_value) { j->return_value = NULL; }
             }
+            return pos;
+        }
+        if (!f && var && var->value && (var->value->type == TYPE_FUNCTION || var->value->type == TYPE_NATIVE_FUNC) &&
+            pos + 1 < j->token_count && strcmp(j->tokens[pos + 1], "(") == 0) {
+            pos += 2;
+            Value *args[MAX_ARGS];
+            int ac = 0;
+            while (pos < j->token_count && strcmp(j->tokens[pos], ")") != 0) {
+                if (ac > 0 && strcmp(j->tokens[pos], ",") == 0) pos++;
+                if (pos >= j->token_count || strcmp(j->tokens[pos], ")") == 0) break;
+                args[ac++] = eval_expression(j, &pos);
+            }
+            if (pos < j->token_count) pos++;
+            Value *r = call_function_value(j, var->value, args, ac);
+            (void)r; 
             return pos;
         }
     }
@@ -3133,6 +3880,7 @@ Value* just_get_var(JustState *j, const char *name) {
 }
 
 void just_set_var(JustState *j, const char *name, Value *val) {
+    if (j) adopt_into_gc(j, val);
     set_var(j, name, val, false);
 }
 
@@ -3141,27 +3889,48 @@ void just_register_function(JustState *j, const char *name, NativeFunc func) {
 }
 
 void run_code(JustState *j, const char *src) { 
-    j->current_line = 1; 
-    tokenize(j, src); 
+    int start = tokenize_append(j, src); 
+    if (j->token_limit_hit) {
+        
+        j->token_limit_hit = false;
+        just_error(j, "Token limit exceeded (see just_set_max_tokens)");
+        return;
+    }
     register_builtins(j); 
     j->current_flow = FLOW_NORMAL; 
     j->return_value = NULL; 
-    execute_block(j, 0, j->token_count); 
-    for (int i = 0; i < j->token_count; i++) free(j->tokens[i]); 
-    free(j->tokens); 
-    j->tokens = NULL; 
-    j->token_count = 0; 
+    execute_block(j, start, j->token_count); 
+    if (j->current_flow == FLOW_ERROR) {
+        
+        j->current_flow = FLOW_NORMAL;
+        free(j->error_message);
+        j->error_message = NULL;
+        j->error_value = NULL;
+    }
+    
 }
 
 JustState* just_init(void) {
-    srand((unsigned)time(NULL));
+    return just_init_ex(JUST_CAP_ALL);
+}
+
+JustState* just_init_ex(int capabilities) {
     JustState *j = calloc(1, sizeof(JustState));
     if (!j) return NULL;
+    j->capabilities = capabilities;
     j->gc_threshold = GC_THRESHOLD;
     j->imported_file_count = 0;
+    
+    j->rand_seed = (uint32_t)time(NULL) ^ (uint32_t)(uintptr_t)j ^ (uint32_t)clock();
+    if (j->rand_seed == 0) j->rand_seed = 0xA5A5A5A5u; 
+    j->max_iterations = MAX_ITERATIONS;
+    j->max_call_depth = MAX_CALL_DEPTH;
+    j->max_tokens = MAX_TOKENS;
 #ifdef _WIN32
     j->win10_ansi_supported = false;
 #endif
+    
+    push_scope(j);
     return j;
 }
 
@@ -3183,7 +3952,7 @@ void just_eval_file(JustState *j, const char *filename) {
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
     char *code = malloc(sz + 1);
-    fread(code, 1, sz, f);
+    size_t _rd = fread(code, 1, sz, f); (void)_rd;
     code[sz] = '\0';
     fclose(f);
     if (j->scope_depth == 0) push_scope(j);
@@ -3199,6 +3968,7 @@ void just_destroy(JustState *j) {
 
 void just_set_const(JustState *j, const char *name, Value *val) {
     if (!j) return;
+    adopt_into_gc(j, val);
     set_var(j, name, val, true);
 }
 
@@ -3208,11 +3978,24 @@ void just_gc_collect(JustState *j) {
 }
 
 void just_gc_set_threshold(JustState *j, int threshold) {
-    /* FIX: this used to be a complete no-op despite being public API that
-     * promises to configure the GC. Now it actually adjusts the per-instance
-     * threshold used by create_value() to decide when to collect. */
+    
     if (!j || threshold <= 0) return;
     j->gc_threshold = threshold;
+}
+
+void just_set_max_iterations(JustState *j, int n) {
+    if (!j || n <= 0) return;
+    j->max_iterations = n;
+}
+
+void just_set_max_call_depth(JustState *j, int n) {
+    if (!j || n <= 0) return;
+    j->max_call_depth = n;
+}
+
+void just_set_max_tokens(JustState *j, long n) {
+    if (!j || n <= 0) return;
+    j->max_tokens = n;
 }
 
 int just_gc_get_count(JustState *j) {
@@ -3362,24 +4145,37 @@ void shutdown_cleanup(JustState *j) {
         }
     }
     
-    /* FIX (small leak): free the per-instance import cache (fix #3) too. */
-    for (int i = 0; i < j->imported_file_count; i++) free(j->imported_files[i]);  // ← ДОБАВЬ ЭТО
+    free(j->scopes);
+    j->scopes = NULL;
+    j->scope_capacity = 0;
+    
+    
+    for (int i = 0; i < j->imported_file_count; i++) free(j->imported_files[i]);
+
+    
+    if (j->tokens) { for (int i = 0; i < j->token_count; i++) free(j->tokens[i]); free(j->tokens); }
+    free(j->token_lines);
+    free(j->error_message);
+
+    
+    free(j->handles);
 
     GCNode *node = j->gc_head;
     while (node) { 
         GCNode *next = node->next; 
-        /* FIX #10 (major GC leak): this loop used to free only the GCNode
-         * wrapper and never the Value it pointed to -- nor that Value's own
-         * owned memory (strings, object key/value arrays, array item
-         * buffers). Every value still alive at program exit leaked in
-         * full. Free each value's internal memory the same way
-         * gc_sweep() does, then the Value struct itself, before freeing
-         * the node. */
+        
         if (node->value) {
             Value *v = node->value;
             switch (v->type) {
                 case TYPE_STRING: free(v->data.string); break;
-                case TYPE_FUNCTION: free(v->data.string); break;  // ← ДОБАВЬ ЭТО
+                case TYPE_FUNCTION:
+                    if (v->is_lambda) {
+                        for (int i = 0; i < v->data.lambda.param_count; i++) free(v->data.lambda.params[i]);
+                        free(v->data.lambda.params);
+                    } else {
+                        free(v->data.string);
+                    }
+                    break;
                 case TYPE_OBJECT:
                     for (int i = 0; i < v->data.object.count; i++) free(v->data.object.keys[i]);
                     free(v->data.object.keys);
