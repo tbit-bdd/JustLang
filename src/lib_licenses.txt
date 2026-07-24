@@ -1,0 +1,50 @@
+THIRD-PARTY LIBRARIES USED BY JUST
+====================================
+This file lists every third-party library Just can optionally be built
+with, their license, and their author, so attribution requirements are
+met regardless of which optional features you include in your build.
+
+------------------------------------------------------------
+1. SQLite (optional core feature: SQLite database support)
+------------------------------------------------------------
+Website:  https://www.sqlite.org
+Author:   D. Richard Hipp and the SQLite Consortium
+License:  Public Domain
+Note:     SQLite is explicitly released into the public domain by its
+          authors. No attribution is legally required, but is included
+          here for completeness and transparency.
+
+------------------------------------------------------------
+2. mbedTLS (optional core feature: HTTPS support)
+------------------------------------------------------------
+Website:  https://github.com/Mbed-TLS/mbedtls
+Version:  2.28.x (LTS branch)
+Author:   Arm Limited (originally PolarSSL, by Paul Bakker)
+License:  Apache License 2.0
+Note:     Apache 2.0 requires retaining the copyright notice and license
+          text when redistributing. The full license text is included in
+          the mbedTLS source tree (mbedtls-2.28.x/LICENSE, apache-2.0.txt)
+          and must be shipped alongside any binary that includes mbedTLS.
+
+------------------------------------------------------------
+3. tiny-regex-c (core feature: regex support, always included)
+------------------------------------------------------------
+Website:  https://github.com/kokke/tiny-regex-c
+Author:   Daniel Lemire and contributors (originally by "kokke")
+License:  Public Domain (Unlicense)
+Note:     Distributed under the Unlicense, placing it in the public
+          domain. No attribution legally required, included here for
+          transparency. Ships as re.c / re.h, compiled directly into
+          just.c.
+
+------------------------------------------------------------
+Summary for redistribution
+------------------------------------------------------------
+- SQLite, tiny-regex-c: public domain, no obligations.
+- mbedTLS: Apache 2.0 -- if you ship a build that includes mbedTLS
+  (i.e. NOT built with -DJUST_NO_TLS), include mbedTLS's LICENSE file
+  and NOTICE (if any) alongside your distribution, and retain copyright
+  notices in the mbedTLS source files themselves (do not strip them).
+
+Just's own code (just.c / just.h / main.c) is licensed separately --
+see the LICENSE file for this project.
