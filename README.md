@@ -2,7 +2,7 @@
 
 *A lightweight embeddable scripting language written in pure C.*
 
-**Current version: 3.0.0**
+**Current version: 1.0.0**
 
 ---
 
@@ -10,20 +10,23 @@
 
 **Just** is a small scripting language built from scratch in C.
 
-- **Single binary** — no dependencies, no package manager, no runtime
+- **Single binary** — no runtime, no package manager. Optional libraries (SQLite, HTTPS) are baked in at link time, not loaded from separate DLLs/.so files at runtime
 - **Cross-platform** — Windows and Linux from the same code
 - **Familiar syntax** — if you know JavaScript or Python, you'll feel at home
 - **Tracing GC** — mark-and-sweep garbage collector with a configurable threshold
+- **Thread-safe** — a single interpreter instance can be called from multiple threads safely (calls are serialized internally); separate instances run fully in parallel
 - **Modules** — split code across files with `import`
-- **C plugins** — extend the language with native code (thread-safe loading)
+- **C plugins** — extend the language with native code (graphics/audio, custom I/O, anything)
 - **Structured error handling** — `try` / `catch` / `finally` / `throw`, with catchable runtime errors instead of crashes (division by zero, stack overflow, etc.)
 - **Closures & lambdas** — `func(x) { ... }` expressions with capture-by-value
 - **Capability-based sandboxing** — turn off file, network, exec, plugin, or database access per-interpreter
 - **Resource limits** — cap iterations, call depth, and token count to safely run untrusted scripts
-- **100+ builtins** — JSON, HTTP, files, strings, math, collections, SQLite, and more
-- **SQLite built-in** — full database support out of the box, zero dependencies (optional at build time)
+- **Regex** — built in, always available, zero extra setup
+- **100+ builtins** — JSON, HTTP(S), files, strings, math, collections, regex, SQLite, and more
+- **SQLite built-in** — full database support out of the box (optional at build time)
+- **HTTPS built-in** — TLS-encrypted requests via mbedTLS (optional at build time)
 
-It compiles in seconds and runs anywhere. Good for automation scripts, learning how languages work, or embedding into larger C/C++ projects — including ones that need to run scripts from untrusted sources.
+It compiles in seconds and runs anywhere. Good for automation scripts, configuration with logic, learning how languages work, or embedding into larger C/C++ projects — including ones that need to run scripts from untrusted sources, or call into the same interpreter from multiple threads.
 
 ---
 
@@ -37,21 +40,9 @@ It compiles in seconds and runs anywhere. Good for automation scripts, learning 
 build.bat
 ```
 
-It will ask whether to include SQLite (`sqlite3.c` must be next to `just.c`) and produce `just.exe` either way.
+It asks whether to include SQLite and/or HTTPS and produces `just.exe` either way. See [Building](#building) below for what files need to be present for each.
 
-**Windows (MinGW), manually:**
-
-```
-gcc -std=c11 -Wall -Wextra -O2 -o just.exe just.c main.c -lws2_32 -lm
-```
-
-**Linux:**
-
-```
-gcc -std=c11 -Wall -Wextra -O2 -o just just.c main.c -lm -ldl
-```
-
-**Without SQLite** (skip bundling `sqlite3.c`), add `-DJUST_NO_SQLITE` on either platform.
+**One command, no script, any platform — see [Building](#building) for the full breakdown of flags.**
 
 ### Run a script
 
@@ -78,7 +69,7 @@ print("Hello from Just!")
 ```just
 // Variables
 let name = "Just"
-const version = 3
+const version = 1
 
 // Objects
 let user = { name: "Alex", age: 25 }
@@ -165,6 +156,21 @@ Lambdas work anywhere a value is expected — as arguments to `filter`, `map`, `
 
 ---
 
+## Regex
+
+Built directly into the core (via [tiny-regex-c](https://github.com/kokke/tiny-regex-c), public domain) — no build flag, no setup, always available.
+
+```just
+print(regex_match("hello world", "world"))          // true
+print(regex_find("id=42", "\\d+"))                   // "42"
+print(regex_find_all("a1 b22 c333", "\\d+"))         // ["1", "22", "333"]
+print(regex_replace("x1y2z3", "\\d", "#"))           // "x#y#z#"
+```
+
+Supports: `. ^ $ * + ? [abc] [^abc] [a-z] \s \S \w \W \d \D`. Does **not** support capture groups, alternation (`|`), or `{n,m}` repetition — it's intentionally minimal, good for validation/extraction, not a full PCRE replacement. Like any naive backtracking regex engine, avoid running untrusted patterns against untrusted, attacker-sized input.
+
+---
+
 ## Modules (import)
 
 Split your code across multiple files with `import`:
@@ -202,53 +208,33 @@ Imports are loaded once and share the global scope. Good for organizing larger p
 | **Types**       | `type`, `int`, `str`, `bool`, `is_number`, `is_string`, `is_bool`, `is_array`, `is_object`, `is_function`, `is_null`                                                                  |
 | **Input**       | `input`                                                                                                                                                                               |
 | **Strings**     | `upper`, `lower`, `trim`, `split`, `join`, `replace`, `contains`, `len`, `starts_with`, `ends_with`, `repeat`, `substr`, `pad_start`, `pad_end`                                      |
+| **Regex**       | `regex_match`, `regex_find`, `regex_find_all`, `regex_replace`                                                                                                                        |
 | **Math**        | `sqrt`, `pow`, `abs`, `min`, `max`, `floor`, `ceil`, `round`, `random`, `sin`, `cos`, `tan`, `log`, `exp`, `clamp`                                                                    |
 | **Constants**   | `PI`, `E`                                                                                                                                                                             |
 | **Paths**       | `dirname`, `basename`, `extname`, `join_path`                                                                                                                                        |
 | **JSON**        | `json`, `json_parse`, `read_json`, `write_json`, `export`, `import_json`                                                                                                             |
-| **HTTP**        | `http_get`, `http_post`                                                                                                                                                              |
-| **Files**       | `read`, `write`, `exists`                                                                                                                                                            |
-| **Time**        | `now`, `sleep`                                                                                                                                                                       |
-| **System**      | `exec`, `env`, `load_plugin`                                                                                                                                                         |
+| **HTTP(S)**     | `http_get`, `http_post` (both transparently support `http://` and `https://` URLs)                                                                                                   |
+| **Files**       | `read`, `write`, `exists`                                                                                                                                                             |
+| **Time**        | `now`, `sleep`                                                                                                                                                                        |
+| **System**      | `exec`, `env`, `load_plugin`                                                                                                                                                          |
 | **Modules**     | `import`                                                                                                                                                                              |
 | **Collections** | `len`, `range`, `filter`, `map`, `reduce`, `find`, `keys`, `values`, `entries`, `has`, `merge`, `array_push`, `array_pop`, `first`, `last`, `reverse`, `sort`, `slice`, `concat`, `unique`, `sum`, `index_of`, `includes` |
 | **Colors**      | `red`, `green`, `blue`, `yellow`, `magenta`, `cyan`, `bold`                                                                                                                           |
 | **Debug**       | `debug`, `dump`, `error`, `help`, `task`, `watch`, `gc_get_count`, `gc_get_allocations`                                                                                              |
 | **SQLite**      | `db_open`, `db_close`, `db_query`, `db_exec`, `db_prepare`, `db_bind`, `db_step`, `db_finalize`, `db_last_insert_id`, `db_changes`, `db_begin`, `db_commit`, `db_rollback`, `db_error` |
 
-### New in this release
-
-`reduce`, `find`, `index_of`, `includes`, `slice`, `concat`, `unique`, `sum`, `clamp`, `pad_start`, `pad_end`, `entries`, `merge`, `substr`, `gc_get_count`, `gc_get_allocations`.
-
-```just
-let nums = [1, 2, 3, 4, 5, 6]
-
-print(reduce(nums, func(a, b) { return a + b }))   // 21
-print(find(nums, func(n) { return n > 3 }))        // 4
-print(slice(nums, 1, 3))                           // [2, 3]
-print(concat([1, 2], [2, 3]))                      // [1, 2, 2, 3]
-print(unique(concat([1, 2], [2, 3])))              // [1, 2, 3]
-print(sum(unique(concat([1, 2], [2, 3]))))         // 6
-print(clamp(-5, 0, 10))                            // 0
-print(pad_start("7", 3, "0"))                      // "007"
-print(index_of([10, 20, 30], 20))                  // 1
-print(includes([1, 2, 3], 3))                      // true
-
-let user = { name: "Alex", age: 25 }
-print(entries(user))                               // [["name","Alex"],["age",25]]
-print(merge(user, { age: 26, city: "NY" }))         // { name:"Alex", age:26, city:"NY" }
-```
-
 ---
 
 ## Security & Sandboxing
 
-Just can restrict what a script is allowed to do. This is useful when running scripts you don't fully trust (plugins, user-submitted automation, etc.) via the C API:
+Just can restrict what a script is allowed to do. This is useful when running scripts you don't fully trust (plugins, user-submitted automation, config files with logic, etc.) via the C API:
 
 ```c
 #include "just.h"
 
-// Only allow pure computation — no files, network, exec, plugins, or DB
+// Only allow pure computation — no files, network, exec, plugins, or DB.
+// This is also a good fit for "config file with logic" use cases: the
+// script can compute values but can't touch the outside world.
 JustState *j = just_init_ex(0);
 
 // Or pick specific capabilities:
@@ -267,7 +253,7 @@ JustState *full = just_init();   // == just_init_ex(JUST_CAP_ALL)
 | `JUST_CAP_DB`      | all `db_*` functions            |
 | `JUST_CAP_ALL`     | everything (default via `just_init()`) |
 
-A script that tries a disabled capability gets a catchable runtime error rather than crashing or silently succeeding.
+A script that tries a disabled capability gets a catchable runtime error rather than crashing or silently succeeding. Regex has no capability flag — it's always available since it can't reach outside the interpreter.
 
 ### Resource Limits
 
@@ -287,9 +273,43 @@ Defaults (overridable at compile time via `#define` before including `just.h`, o
 
 ---
 
+## Thread Safety
+
+A single `JustState` instance can now be shared across threads safely — calls to `just_eval`, `just_eval_file`, `just_call`, and the variable/GC/registration API are internally serialized (similar in spirit to Python's GIL: queued, not truly parallel, but never racing or corrupting state). Separate `JustState` instances remain fully independent and run in true parallel on separate threads with no shared locking at all.
+
+```c
+JustState *shared = just_init();
+// safe to call just_eval(shared, ...) / just_call(shared, ...) from multiple
+// worker threads concurrently — they'll be serialized, not corrupted
+```
+
+---
+
+## Calling Just Functions from C (`just_call`)
+
+For host applications that call the same Just function repeatedly — once per frame in a game loop, once per request in a server — `just_call` invokes an already-defined function directly without re-tokenizing a call-expression string through `just_eval()` every time:
+
+```c
+just_eval(j, "func update(dt) { ... }");   // define once
+
+// then, every frame:
+Value *args[1] = { just_number(delta_time) };
+Value *result = just_call(j, "update", args, 1);
+```
+
+---
+
+## HTTPS (Optional, mbedTLS)
+
+`http_get`/`http_post` transparently support `https://` URLs when built with mbedTLS (see [Building](#building)). Without it (`-DJUST_NO_TLS`), `https://` calls return an empty string with a clear error message — `http://` always works either way.
+
+**Known limitation (v1):** certificate verification is disabled — there's no cross-platform way to reliably locate a trusted CA bundle (especially on older Windows versions), so this is deferred rather than shipped half-working. Connections are encrypted (safe from passive eavesdropping) but not verified against a certificate authority (not safe from an active man-in-the-middle). Treat it accordingly — fine for calling APIs over your own network/VPN or trusted infrastructure, not yet for handling untrusted/adversarial network paths.
+
+---
+
 ## SQLite Built-in (Optional, Zero Dependencies)
 
-Just can bundle **SQLite** directly in the binary — no external libraries needed. It's opt-in at build time: drop `sqlite3.c` next to `just.c` and build normally (or answer "yes" in `build.bat`). Build with `-DJUST_NO_SQLITE` to leave it out entirely.
+Just can bundle **SQLite** directly in the binary — no external libraries needed. It's opt-in at build time: drop `sqlite3.c`/`sqlite3.h` next to `just.c` and build normally (or answer "yes" in `build.bat`). Build with `-DJUST_NO_SQLITE` to leave it out entirely.
 
 ```just
 let db = db_open("app.db")
@@ -328,7 +348,7 @@ db_close(db)
 **SQLite Functions:**
 
 | Function                  | Description                             |
-| ------------------------- | --------------------------------------- |
+| ------------------------- | ---------------------------------------- |
 | `db_open(filename)`       | Open or create database                 |
 | `db_close(db)`            | Close database                          |
 | `db_query(db, sql)`       | Execute SQL (returns array for SELECT)  |
@@ -371,6 +391,10 @@ just_eval_file(j, "game_logic.just");
 // Get result
 Value *result = just_get_var(j, "result");
 
+// Call a specific function repeatedly without re-parsing (e.g. per frame)
+Value *args[1] = { just_number(0.016) };
+just_call(j, "update", args, 1);
+
 just_destroy(j);
 ```
 
@@ -383,6 +407,7 @@ just_destroy(j);
 | `just_destroy(j)`                       | Destroy interpreter                          |
 | `just_eval(j, code)`                    | Execute string                               |
 | `just_eval_file(j, filename)`           | Execute file                                 |
+| `just_call(j, func_name, args, argc)`   | Call an already-defined function directly, no re-parsing |
 | `just_register_function(j, name, func)` | Register C function                          |
 | `just_get_var(j, name)`                 | Get variable                                 |
 | `just_set_var(j, name, val)`            | Set variable                                 |
@@ -399,11 +424,13 @@ just_destroy(j);
 | `just_print_state(j)`                   | Dump interpreter state to stdout (debugging) |
 | `just_version()` / `just_version_major/minor/patch()` | Query the linked library version    |
 
+All of the above are safe to call concurrently on the same `JustState` from multiple threads (see [Thread Safety](#thread-safety)).
+
 ---
 
 ## C Plugins
 
-Write native functions in C and call them from Just. Plugin loading is thread-safe.
+Write native functions in C and call them from Just. Plugin loading is thread-safe. Plugins are entirely separate from the core build — the core interpreter never needs to know a plugin exists until `load_plugin()` is called at runtime.
 
 **myplugin.c:**
 
@@ -420,6 +447,8 @@ void init_plugin(void (*register_func)(const char*, NativeFunc)) {
 }
 ```
 
+Build it as a shared library (`gcc -shared -fPIC myplugin.c -o myplugin.so`) and, importantly, **build the core `just` executable itself with `-rdynamic`** (already the default in `build.bat` and the commands below) — without it, any plugin that calls back into `just_*` functions (i.e. almost any useful plugin) fails to load with a silent "undefined symbol" error.
+
 **In Just:**
 
 ```just
@@ -433,35 +462,119 @@ Gated by `JUST_CAP_PLUGIN` — see [Security & Sandboxing](#security--sandboxing
 
 ## Building
 
+Just's core (`just.c`/`just.h`/`main.c`) always compiles with a single command — no CMake, no complicated build system. This assumes you keep the extra libraries (SQLite, mbedTLS, regex) in a `src/` folder next to `just.c`, the same way this project is already set up. SQLite and HTTPS are optional — turn them on or off by adding/removing one flag. Regex is always included, no setup needed.
+
+**Important:** All build commands assume you're in the `src/` folder. First do:
+```bash
+cd src
 ```
-# Windows (MinGW) — interactive, asks about SQLite
-build.bat
 
-# Windows (MinGW) — manual
-gcc -std=c11 -Wall -Wextra -O2 -o just.exe just.c main.c -lws2_32 -lm
+---
 
+### 1. Core only — no SQLite, no HTTPS
+
+**Smallest binary (~167 KB).** Good starting point if you're not sure yet what you need.
+
+```
 # Linux
-gcc -std=c11 -Wall -Wextra -O2 -o just just.c main.c -lm -ldl
+gcc -std=c11 -O2 -pthread -rdynamic -DJUST_NO_SQLITE -DJUST_NO_TLS just.c main.c -o just -ldl -lm
 
-# Either platform, without SQLite
-gcc -std=c11 -Wall -Wextra -O2 -DJUST_NO_SQLITE -o just just.c main.c -lm -ldl
+# Windows (MinGW)
+gcc -std=c11 -O2 -pthread -Wl,--export-all-symbols -DJUST_NO_SQLITE -DJUST_NO_TLS just.c main.c -o just.exe -lws2_32 -lm
 ```
 
-No CMake, no external Makefile required — one command (or `build.bat` on Windows).
+---
+
+### 2. With SQLite (no HTTPS)
+
+Make sure `src/sqlite3.c` and `src/sqlite3.h` are present.
+
+```
+# Linux
+gcc -std=c11 -O2 -pthread -rdynamic -DJUST_NO_TLS just.c main.c -o just -ldl -lm
+
+# Windows (MinGW)
+gcc -std=c11 -O2 -pthread -Wl,--export-all-symbols -DJUST_NO_TLS just.c main.c -o just.exe -lws2_32 -lm
+```
+
+> `-DJUST_NO_SQLITE` is **not** passed — SQLite is included automatically when `sqlite3.c` is found.
+
+---
+
+### 3. With HTTPS (no SQLite)
+
+```
+# Linux
+gcc -std=c11 -O2 -pthread -rdynamic -DJUST_NO_SQLITE -Imbedtls/include just.c main.c \
+    -o just -Lmbedtls/library -lmbedtls -lmbedx509 -lmbedcrypto -ldl -lm
+
+# Windows (MinGW)
+gcc -std=c11 -O2 -pthread -Wl,--export-all-symbols -DJUST_NO_SQLITE -Imbedtls\include just.c main.c \
+    -o just.exe -Lmbedtls\library -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lm
+```
+
+> `-DJUST_NO_TLS` is **not** passed — HTTPS is included when mbedTLS libraries are present.
+
+---
+
+### 4. Everything together — SQLite + HTTPS
+
+**Full build (~1.93 MB).** Requires both `src/sqlite3.c` and built mbedTLS libraries.
+
+```
+# Linux
+gcc -std=c11 -O2 -pthread -rdynamic -Imbedtls/include just.c main.c \
+    -o just -Lmbedtls/library -lmbedtls -lmbedx509 -lmbedcrypto -ldl -lm
+
+# Windows (MinGW)
+gcc -std=c11 -O2 -pthread -Wl,--export-all-symbols -Imbedtls\include just.c main.c \
+    -o just.exe -Lmbedtls\library -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lm
+```
+
+> Neither `-DJUST_NO_SQLITE` nor `-DJUST_NO_TLS` is passed — both are included.
+
+---
+
+### Quick reference: build variants
+
+| Variant | Binary size | Linux command | Windows command |
+|---------|-------------|---------------|-----------------|
+| **Core only** | ~167 KB | `gcc -std=c11 -O2 -pthread -rdynamic -DJUST_NO_SQLITE -DJUST_NO_TLS just.c main.c -o just -ldl -lm` | `gcc -std=c11 -O2 -pthread -Wl,--export-all-symbols -DJUST_NO_SQLITE -DJUST_NO_TLS just.c main.c -o just.exe -lws2_32 -lm` |
+| **+ SQLite** | ~1.22 MB | `gcc -std=c11 -O2 -pthread -rdynamic -DJUST_NO_TLS just.c main.c -o just -ldl -lm` | `gcc -std=c11 -O2 -pthread -Wl,--export-all-symbols -DJUST_NO_TLS just.c main.c -o just.exe -lws2_32 -lm` |
+| **+ HTTPS** | ~902 KB | `gcc -std=c11 -O2 -pthread -rdynamic -DJUST_NO_SQLITE -Imbedtls/include just.c main.c -o just -Lmbedtls/library -lmbedtls -lmbedx509 -lmbedcrypto -ldl -lm` | `gcc -std=c11 -O2 -pthread -Wl,--export-all-symbols -DJUST_NO_SQLITE -Imbedtls\include just.c main.c -o just.exe -Lmbedtls\library -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lm` |
+| **Full** (SQL + HTTPS) | ~1.93 MB | `gcc -std=c11 -O2 -pthread -rdynamic -Imbedtls/include just.c main.c -o just -Lmbedtls/library -lmbedtls -lmbedx509 -lmbedcrypto -ldl -lm` | `gcc -std=c11 -O2 -pthread -Wl,--export-all-symbols -Imbedtls\include just.c main.c -o just.exe -Lmbedtls\library -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lm` |
+
+---
+
+### Or just double-click the script (Windows)
+
+```
+build.bat
+```
+
+It asks two simple yes/no questions (SQLite? HTTPS?) and builds `just.exe` for you — no need to remember any of the commands above. If something's missing, it tells you clearly what and where, instead of a confusing wall of linker errors.
+
+### Turning SQLite/HTTPS off on purpose
+
+Add `-DJUST_NO_SQLITE` and/or `-DJUST_NO_TLS` to any command above if you want to build without them even though the files are present.
 
 ---
 
 ## Project Status
 
-Just is under active development, now at **version 3.0.0**. It handles real tasks — HTTP requests, JSON processing, file I/O, SQLite databases, C plugins — and now adds proper error handling, closures, and a capability-based sandbox for running untrusted scripts safely. The entire language can still be learned in a couple of evenings. Fully open to contributions: libraries, plugins, documentation, ideas.
+Just is under active development, now at **version 1.0.0** — the first public release. It handles real tasks — HTTP(S) requests, JSON processing, file I/O, SQLite databases, regex, C plugins — with structured error handling, closures, thread safety, and a capability-based sandbox for running untrusted scripts safely. The entire language can still be learned in a couple of evenings. Fully open to contributions: libraries, plugins, documentation, ideas.
 
-### Highlights in v3.0.0
+### Highlights in v1.0.0
 
+- **First public release** — versioning reset to 1.0.0
+- **Regex**, built into the core with zero setup
+- **HTTPS**, optional at build time via mbedTLS (certificate verification not yet implemented — see [HTTPS](#https-optional-mbedtls))
+- **Thread-safe interpreter instances** — one `JustState` can now be called safely from multiple threads
+- **`just_call()`** — call a Just function from C repeatedly without re-parsing a call string each time
 - **Structured error handling** — `try`/`catch`/`finally`/`throw`, catchable division-by-zero and stack-overflow errors instead of crashes
 - **Closures & lambdas** — `func(x) { ... }` expressions with capture-by-value
 - **Capability-based sandboxing** — `just_init_ex()` with `JUST_CAP_EXEC/FILES/NET/PLUGIN/DB`
 - **Resource limits** — configurable iteration, call-depth, and token caps for untrusted scripts
-- **Thread-safe plugin loading**
 - **Expanded standard library** — `reduce`, `find`, `slice`, `concat`, `unique`, `sum`, `clamp`, `pad_start`/`pad_end`, `entries`, `merge`, and more
 - **Negative array indexing** — `arr[-1]`
 - **Zero-dependency SQLite**, still optional at build time
